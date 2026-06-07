@@ -22,22 +22,16 @@ try:
         TG_BOT_TOKEN = config.get("TG_BOT_TOKEN")
         TG_CHAT_ID = str(config.get("TG_CHAT_ID"))
         NTFY_URL = config.get("NTFY_URL")
-        MY_MAX_ID = config.get("MY_MAX_ID") # Ваш личный ID для фильтрации эха
+        MY_MAX_ID = config.get("MY_MAX_ID")
         
         if not all([MAX_PHONE, TG_BOT_TOKEN, TG_CHAT_ID]):
-            raise ValueError("В constants.json отсутствуют обязательные ключи (MAX_PHONE, TG_BOT_TOKEN, TG_CHAT_ID)")
+            raise ValueError("В constants.json отсутствуют обязательные ключи")
 except Exception as e:
     print(f"Критическая ошибка инициализации конфигурации: {e}")
     sys.exit(1)
 
-# Кэш для предотвращения "эха" при пересылке сообщений из ТГ в MAX
+# Кэш для предотвращения "эха"
 RECENT_SENT_TEXTS = collections.deque(maxlen=50)
-
-# --- РЕКВИЗИТЫ ---
-CONTACTS = {
-    0: "null",
-}
-
 SERVER_NAME = "Telemax"
 
 from pymax import SocketMaxClient, Message
@@ -62,11 +56,10 @@ db_cursor = db_conn.cursor()
 
 db_cursor.execute('''CREATE TABLE IF NOT EXISTS queue_v2 
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, max_chat_id TEXT, thread_id INTEGER, text_data TEXT, file_data TEXT)''')
-
-# ОБНОВЛЕННАЯ ТАБЛИЦА TOPICS: Добавлено поле type
 db_cursor.execute('''CREATE TABLE IF NOT EXISTS topics 
                      (max_chat_id TEXT PRIMARY KEY, thread_id INTEGER, name TEXT, type TEXT)''')
-
+db_cursor.execute('''CREATE TABLE IF NOT EXISTS contacts 
+                     (max_id TEXT PRIMARY KEY, alias TEXT)''')
 db_cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
 db_cursor.execute('''CREATE TABLE IF NOT EXISTS queue_dead_letter 
                      (id INTEGER PRIMARY KEY, type TEXT, max_chat_id TEXT, thread_id INTEGER, text_data TEXT, file_data TEXT, reason TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
@@ -76,11 +69,15 @@ db_cursor.execute("SELECT value FROM settings WHERE key='last_msg_time'")
 row = db_cursor.fetchone()
 global_last_msg_time = row[0] if row else "Ещё не было"
 
+# Триггер для моментальной очереди
+queue_event = asyncio.Event()
+
 def enqueue_v2(item_type, max_chat_id, thread_id, text_data, file_data=None):
     try:
         db_cursor.execute("INSERT INTO queue_v2 (type, max_chat_id, thread_id, text_data, file_data) VALUES (?, ?, ?, ?, ?)",
                           (item_type, str(max_chat_id), thread_id, text_data, file_data))
         db_conn.commit()
+        queue_event.set() # Будим очередь моментально!
     except Exception as e:
         logger.error(f"DB Insert Error: {e}")
 
@@ -125,11 +122,10 @@ def systemd_notify(message):
 
 def send_push(msg, tags="warning", priority=3):
     if not NTFY_URL: return
-    try:
-        requests.post(NTFY_URL, data=msg.encode('utf-8'), headers={"Title": SERVER_NAME, "Tags": tags, "Priority": str(priority)}, timeout=10)
+    try: requests.post(NTFY_URL, data=msg.encode('utf-8'), headers={"Title": SERVER_NAME, "Tags": tags, "Priority": str(priority)}, timeout=10)
     except Exception: pass
 
-# --- ФУНКЦИИ ОТПРАВКИ В TELEGRAM ---
+# --- ФУНКЦИИ TELEGRAM API ---
 def tg_api_call(method, params=None, files=None, timeout=60):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
     cmd = ["curl", "-sS", "-x", "socks5h://127.0.0.1:10808", "--max-time", str(timeout)]
@@ -144,10 +140,7 @@ def tg_api_call(method, params=None, files=None, timeout=60):
         if result.returncode != 0: return False, "CURL_ERROR_OR_TIMEOUT"
         try: data = json.loads(result.stdout)
         except json.JSONDecodeError: return False, "JSON_DECODE_ERROR"
-        if not data.get("ok", False):
-            desc = data.get("description", str(data))
-            if 400 <= data.get("error_code", 0) < 500: return "FATAL", desc
-            return False, desc
+        if not data.get("ok", False): return ("FATAL" if 400 <= data.get("error_code", 0) < 500 else False), data.get("description", str(data))
         return True, data
     except Exception as e: return False, str(e)
 
@@ -157,35 +150,18 @@ def create_telegram_topic(chat_id, name):
     return None
 
 def set_telegram_reaction(chat_id, message_id, emoji="👍"):
-    params = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reaction": json.dumps([{"type": "emoji", "emoji": emoji}])
-    }
-    return tg_api_call("setMessageReaction", params=params, timeout=10)
+    return tg_api_call("setMessageReaction", params={"chat_id": chat_id, "message_id": message_id, "reaction": json.dumps([{"type": "emoji", "emoji": emoji}])}, timeout=10)
 
 def send_telegram_media(chat_id, thread_id, text, file_info):
-    file_path = file_info["path"]
-    ext = file_info["ext"]
+    file_path, ext = file_info["path"], file_info["ext"]
     if not os.path.exists(file_path): return True, None
-        
     params = {"chat_id": chat_id, "caption": text or "", "parse_mode": "HTML"}
     if thread_id: params["message_thread_id"] = thread_id
-
-    # По умолчанию считаем всё неизвестное документами и даем большой таймаут
     field = "document"
     timeout_sec = 300 
-    
-    if ext in [".jpg", ".jpeg", ".png", ".webp"]: 
-        field = "photo"
-        timeout_sec = 60
-    elif ext == ".ogg": 
-        field = "voice"
-        timeout_sec = 60
-    elif ext == ".mp4": 
-        field = "video"
-        timeout_sec = 300 
-
+    if ext in [".jpg", ".jpeg", ".png", ".webp"]: field, timeout_sec = "photo", 60
+    elif ext == ".ogg": field, timeout_sec = "voice", 60
+    elif ext == ".mp4": field, timeout_sec = "video", 300 
     return tg_api_call(f"send{field.capitalize()}", params=params, files={field: file_path}, timeout=timeout_sec)
 
 def send_telegram_album(chat_id, thread_id, text, files_info):
@@ -210,8 +186,7 @@ def update_status_message(text):
     try:
         db_cursor.execute("SELECT value FROM settings WHERE key='status_msg_id'")
         row = db_cursor.fetchone()
-        msg_id = row[0] if row else None
-        needs_new = False
+        msg_id, needs_new = row[0] if row else None, False
         if msg_id:
             ok, data = tg_api_call("editMessageText", params={"chat_id": TG_CHAT_ID, "message_id": msg_id, "text": text, "parse_mode": "HTML"}, timeout=10)
             if ok == "FATAL" and isinstance(data, str) and "not found" in data.lower(): needs_new = True
@@ -224,28 +199,41 @@ def update_status_message(text):
                 tg_api_call("pinChatMessage", params={"chat_id": TG_CHAT_ID, "message_id": new_id, "disable_notification": "true"})
     except Exception: pass
 
-# --- ПОТОКОВОЕ СКАЧИВАНИЕ ФАЙЛОВ ИЗ MAX ---
+# --- СКАЧИВАНИЕ ФАЙЛОВ: TG -> MAX ---
+async def download_tg_file(file_id, ext=".jpg"):
+    ok, data = await asyncio.get_running_loop().run_in_executor(None, tg_api_call, "getFile", {"file_id": file_id})
+    if ok is True and isinstance(data, dict):
+        file_path = data.get("result", {}).get("file_path")
+        if file_path:
+            url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_path}"
+            dl_path = os.path.join(TEMP_DOWNLOAD_DIR, f"tg_{file_id}{ext}")
+            def do_dl():
+                try:
+                    r = requests.get(url, timeout=60)
+                    if r.status_code == 200:
+                        with open(dl_path, 'wb') as f: f.write(r.content)
+                        return True
+                except Exception: pass
+                return False
+            if await asyncio.get_running_loop().run_in_executor(None, do_dl):
+                return dl_path
+    return None
+
+# --- СКАЧИВАНИЕ ФАЙЛОВ: MAX -> TG ---
 async def brutal_download(client_instance, attach, download_path):
     url_to_download = None
     try:
-        if hasattr(client_instance, "get_file_url"):
-            url_to_download = await client_instance.get_file_url(attach)
+        if hasattr(client_instance, "get_file_url"): url_to_download = await client_instance.get_file_url(attach)
     except: pass
-
     if not url_to_download:
-        # ИСПРАВЛЕНИЕ: Теперь ищем любые возможные ID, включая file_id для документов
-        actual_id = None
+        actual_id, token = None, attach.get('token') if isinstance(attach, dict) else getattr(attach, 'token', None)
+        # Фикс для файлов: перебираем все возможные ID, включая file_id для документов
         for attr_name in ['file_id', 'video_id', 'image_id', 'audio_id', 'id']:
             val = attach.get(attr_name) if isinstance(attach, dict) else getattr(attach, attr_name, None)
             if val:
-                actual_id = val
-                break
-                
-        token = attach.get('token') if isinstance(attach, dict) else getattr(attach, 'token', None)
-        
+                actual_id = val; break
         if actual_id:
-            file_id_str = f"{actual_id}"
-            if token: file_id_str += f"?token={token}"
+            file_id_str = f"{actual_id}?token={token}" if token else f"{actual_id}"
             try:
                 if hasattr(client_instance, "_api") and hasattr(client_instance._api, "get_file"):
                     file_content = await client_instance._api.get_file(file_id_str)
@@ -253,35 +241,28 @@ async def brutal_download(client_instance, attach, download_path):
                         with open(download_path, 'wb') as f: f.write(file_content)
                         return True
             except: pass
-
     if not url_to_download:
         for attr in ['url', 'file_url', 'download_url', 'source', 'link', 'href', 'base_url']:
             val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
             if isinstance(val, str) and val.startswith("http"):
-                url_to_download = val
-                break
-            
+                url_to_download = val; break
     if url_to_download:
         try:
             def do_download():
-                headers = {"User-Agent": "Mozilla/5.0"}
-                with requests.get(url_to_download, headers=headers, timeout=(15, 300), stream=True) as r:
+                with requests.get(url_to_download, headers={"User-Agent": "Mozilla/5.0"}, timeout=(15, 300), stream=True) as r:
                     if r.status_code == 200:
                         with open(download_path, 'wb') as f:
                             for chunk in r.iter_content(chunk_size=8192):
                                 if chunk: f.write(chunk)
                         return True
                     return False
-            loop = asyncio.get_running_loop()
-            if await loop.run_in_executor(None, do_download): return True
+            if await asyncio.get_running_loop().run_in_executor(None, do_download): return True
         except: pass
-
     for attr in ['bytes', 'file_bytes', 'data', 'content']:
         val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
         if isinstance(val, bytes):
             with open(download_path, 'wb') as f: f.write(val)
             return True
-            
     return False
 
 ua = UserAgentPayload(device_type="DESKTOP")
@@ -289,7 +270,6 @@ client = SocketMaxClient(phone=MAX_PHONE, work_dir="session_cache", headers=ua)
 async def fake_send_navigation_event(*args, **kwargs): pass
 client._send_navigation_event = fake_send_navigation_event
 client.send_navigation_event = fake_send_navigation_event
-
 message_queue = asyncio.Queue()
 
 @client.on_message()
@@ -308,7 +288,6 @@ async def process_and_enqueue(message: Message) -> None:
     global_last_msg_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     db_cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("last_msg_time", global_last_msg_time))
     db_conn.commit()
-    
     dump_message_to_json(message, reason="incoming")
 
     msg_type_raw = getattr(message, "type", "").upper()
@@ -316,30 +295,18 @@ async def process_and_enqueue(message: Message) -> None:
     sender_id = getattr(message, "sender", None)
     t = str(getattr(message, "text", "") or getattr(message, "caption", "")).strip()
 
-    # --- ФИЛЬТР 1: Защита от дублей (наш собственный ответ из ТГ) ---
-    if t and t in RECENT_SENT_TEXTS:
-        logger.info("Пропущено: Эхо-сообщение (мы его только что отправили из Telegram).")
-        return
+    if t and t in RECENT_SENT_TEXTS: return
+    if getattr(message, "out", False) or getattr(message, "outgoing", False) or getattr(message, "is_out", False): return
+    if MY_MAX_ID and sender_id == MY_MAX_ID: return
+    if msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or getattr(message, "action", None): return
 
-    # --- ФИЛЬТР 2: Базовые исходящие ---
-    is_outgoing = getattr(message, "out", False) or getattr(message, "outgoing", False) or getattr(message, "is_out", False)
-    if is_outgoing:
-        logger.info("Пропущено: Сообщение помечено как исходящее (out=True).")
-        return
-
-    # --- ФИЛЬТР 3: Защита от своих же сообщений, отправленных с телефона ---
-    if MY_MAX_ID and sender_id == MY_MAX_ID:
-        logger.info(f"Пропущено: Сообщение от самого себя (ID: {MY_MAX_ID}).")
-        return
-
-    # --- ФИЛЬТР 4: Системные события ---
-    if msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or getattr(message, "action", None):
-        return
-
-    # Получение имени отправителя
+    # --- ИЩЕМ АЛИАС В БД ИЛИ ЗАПРАШИВАЕМ СЕРВЕР ---
     sender_name = "Неизвестный"
     if sender_id is not None:
-        if sender_id in CONTACTS: sender_name = CONTACTS[sender_id]
+        db_cursor.execute("SELECT alias FROM contacts WHERE max_id = ?", (str(sender_id),))
+        alias_row = db_cursor.fetchone()
+        if alias_row: 
+            sender_name = alias_row[0]
         else:
             try:
                 ui = await asyncio.wait_for(client.get_user(sender_id), timeout=5.0)
@@ -350,10 +317,8 @@ async def process_and_enqueue(message: Message) -> None:
             except: sender_name = f"ID:{sender_id}"
     elif msg_type_raw == "CHANNEL": sender_name = "Канал"
 
-    # Получение названия чата
     chat_title = getattr(message, "chat_title", None) or getattr(message, "title", None)
-    if not chat_title and getattr(message, "chat", None):
-        chat_title = getattr(message.chat, "title", None) or getattr(message.chat, "name", None)
+    if not chat_title and getattr(message, "chat", None): chat_title = getattr(message.chat, "title", None) or getattr(message.chat, "name", None)
     if not chat_title and chat_id:
         try:
             ci = await asyncio.wait_for(client.get_chat(str(chat_id)), timeout=5.0)
@@ -362,32 +327,38 @@ async def process_and_enqueue(message: Message) -> None:
 
     if msg_type_raw == "CHANNEL" and sender_name == "Канал" and chat_title: sender_name = chat_title
 
-    # --- УМНАЯ КЛАССИФИКАЦИЯ ID И ТИПОВ ЧАТОВ ---
     is_private = False
     if msg_type_raw in ["PRIVATE", "BOT"]: is_private = True
-    elif msg_type_raw == "USER":
-        is_private = not (chat_id and str(chat_id).startswith("-"))
+    elif msg_type_raw == "USER": is_private = not (chat_id and str(chat_id).startswith("-"))
 
     if is_private:
-        # ИСПРАВЛЕНИЕ: Биндим топик к ID диалога (бота), а не к служебному отправителю
         target = chat_id if chat_id else sender_id
         topic_target_id = f"PRIVATE_{target}" if target else "PRIVATE_UNKNOWN"
         m_type = "private"
         
-        # Имя топика в первую очередь берем от названия бота/чата
-        if chat_title:
-            topic_name = chat_title
-        else:
-            topic_name = sender_name if sender_name and not sender_name.startswith("ID:") else f"Chat {target}"
+        # Если есть алиас для этого диалога, используем его для имени топика
+        db_cursor.execute("SELECT alias FROM contacts WHERE max_id = ?", (str(target),))
+        topic_alias_row = db_cursor.fetchone()
+        
+        if topic_alias_row: topic_name = topic_alias_row[0]
+        elif chat_title: topic_name = chat_title
+        else: topic_name = sender_name if sender_name and not sender_name.startswith("ID:") else f"Chat {target}"
     else:
         topic_target_id = str(chat_id) if chat_id else "UNKNOWN_GROUP"
         m_type = "group"
         topic_name = chat_title if chat_title else f"Группа {topic_target_id}"
 
-    # Создание/поиск топика в БД
-    db_cursor.execute("SELECT thread_id FROM topics WHERE max_chat_id = ?", (topic_target_id,))
+    db_cursor.execute("SELECT thread_id, name FROM topics WHERE max_chat_id = ?", (topic_target_id,))
     row = db_cursor.fetchone()
-    if row: thread_id = row[0]
+    
+    # Авто-переименование существующего топика, если алиас изменился
+    if row: 
+        thread_id, old_topic_name = row
+        if old_topic_name != topic_name:
+            ok, _ = await asyncio.get_running_loop().run_in_executor(None, tg_api_call, "editForumTopic", {"chat_id": TG_CHAT_ID, "message_thread_id": thread_id, "name": topic_name[:128]})
+            if ok:
+                db_cursor.execute("UPDATE topics SET name = ? WHERE thread_id = ?", (topic_name, thread_id))
+                db_conn.commit()
     else:
         loop = asyncio.get_running_loop()
         thread_id = await loop.run_in_executor(None, create_telegram_topic, TG_CHAT_ID, topic_name)
@@ -395,9 +366,7 @@ async def process_and_enqueue(message: Message) -> None:
             safe_name = "".join(c for c in topic_name if c.isalnum() or c in " _-")[:128] or f"Topic {topic_target_id}"
             thread_id = await loop.run_in_executor(None, create_telegram_topic, TG_CHAT_ID, safe_name)
         if thread_id:
-            # ЗАПИСЫВАЕМ С ПОЛЕМ TYPE
-            db_cursor.execute("INSERT INTO topics (max_chat_id, thread_id, name, type) VALUES (?, ?, ?, ?)", 
-                              (topic_target_id, thread_id, topic_name, m_type))
+            db_cursor.execute("INSERT INTO topics (max_chat_id, thread_id, name, type) VALUES (?, ?, ?, ?)", (topic_target_id, thread_id, topic_name, m_type))
             db_conn.commit()
 
     header = f"[{sender_name}]:" if (is_private or not chat_title or chat_title == sender_name) else f"[{chat_title}], [{sender_name}]:"
@@ -408,7 +377,6 @@ async def process_and_enqueue(message: Message) -> None:
         val = getattr(message, attr, None)
         if val: all_attachments.extend(val) if isinstance(val, list) else all_attachments.append(val)
 
-    # Обработка Forward
     link_obj = getattr(message, "link", None)
     if link_obj and getattr(link_obj, "type", None) == "FORWARD":
         nested_msg = getattr(link_obj, "message", None)
@@ -478,6 +446,7 @@ async def process_and_enqueue(message: Message) -> None:
     if not downloaded_files and not caption_assigned:
         enqueue_v2("text", chat_id, thread_id, full_caption, None)
 
+# --- ИНСТАНТНАЯ ОЧЕРЕДЬ (БЕЗ ЗАДЕРЖЕК) ---
 async def queue_processor():
     loop = asyncio.get_running_loop()
     retry_counts = {}
@@ -505,7 +474,7 @@ async def queue_processor():
                     if file_data:
                         for f in json.loads(file_data):
                             if os.path.exists(f.get("path", "")): os.remove(f["path"])
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.1) 
                 else:
                     if isinstance(error_data, str) and ("thread not found" in error_data.lower() or "topic not found" in error_data.lower()):
                         db_cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
@@ -520,7 +489,11 @@ async def queue_processor():
                         db_conn.commit()
                         retry_counts.pop(qid, None)
                     else: await asyncio.sleep(min(300, 5 * (2 ** (retry_counts[qid] - 1))))
-            else: await asyncio.sleep(2.0)
+            else:
+                # Мгновенно засыпаем до появления новой задачи
+                queue_event.clear()
+                try: await asyncio.wait_for(queue_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError: pass
         except Exception: await asyncio.sleep(5.0)
 
 # --- TELEGRAM LONG POLLING ---
@@ -536,29 +509,56 @@ async def tg_command_polling():
                     offset = update["update_id"] + 1
                     msg = update.get("message")
                     if msg and str(msg.get("chat", {}).get("id", "")) == TG_CHAT_ID:
-                        text = msg.get("text", "").strip()
+                        text = msg.get("text", "") or msg.get("caption", "")
+                        text = text.strip() if isinstance(text, str) else ""
+                        
                         if text.startswith("/"): await handle_tg_command(msg)
                         elif msg.get("message_thread_id") and not msg.get("is_automatic_forward"):
                             await handle_tg_reply_to_max(msg)
             else: await asyncio.sleep(2)
         except Exception: await asyncio.sleep(5)
 
+# --- УМНАЯ ОТПРАВКА МЕДИА И ТЕКСТА В MAX ---
+async def send_to_max_wrapper(target_id, text, dl_path=None):
+    success = False
+    if dl_path:
+        for method_name in ["send_media", "send_file", "send_document", "send_photo"]:
+            if hasattr(client, method_name):
+                method = getattr(client, method_name)
+                try: 
+                    await method(target_id, dl_path)
+                    success = True; break
+                except Exception:
+                    try: 
+                        await method(dl_path, target_id)
+                        success = True; break
+                    except Exception: pass
+
+    if text and (success or not dl_path):
+        try:
+            if hasattr(client, "send_message"): await client.send_message(text, target_id)
+            elif hasattr(client, "send_text"): await client.send_text(text, target_id)
+            success = True
+        except Exception as e:
+            if not dl_path: raise e 
+            else: logger.error(f"Файл ушел, но текст не отправился: {e}")
+            
+    if not success and dl_path: raise Exception("Методы отправки файлов не сработали в PyMax")
+    return success
 
 async def handle_tg_reply_to_max(msg):
-    text = msg.get("text", "")
-    if isinstance(text, str): text = text.strip()
-    thread_id = msg.get("message_thread_id")
-    message_id = msg.get("message_id") # <-- Извлекаем ID сообщения
+    photo, document = msg.get("photo"), msg.get("document")
+    text = msg.get("text") or msg.get("caption") or ""
+    text = text.strip() if isinstance(text, str) else ""
+    thread_id, message_id = msg.get("message_thread_id"), msg.get("message_id")
 
-    if not text or not thread_id: return
+    if not thread_id or (not text and not photo and not document): return
 
     try:
         db_cursor.execute("SELECT max_chat_id, type FROM topics WHERE thread_id = ?", (thread_id,))
         row = db_cursor.fetchone()
         if row:
             raw_target, m_type = row
-            
-            # РАСШИФРОВКА ID НА ОСНОВЕ ТИПА
             if m_type == "private" and raw_target.startswith("PRIVATE_"):
                 try: target_id = int(raw_target.replace("PRIVATE_", ""))
                 except ValueError: return
@@ -567,39 +567,82 @@ async def handle_tg_reply_to_max(msg):
                 except ValueError: target_id = raw_target 
 
             if target_id:
-                logger.info(f"Отправка ответа в MAX (target_id: {target_id}, текст: {text[:20]}...)")
-                
-                # Добавляем текст в кэш ДО отправки, чтобы фильтр сразу поймал эхо
-                RECENT_SENT_TEXTS.append(text)
+                dl_path = None
+                if photo or document:
+                    file_id = photo[-1]["file_id"] if photo else document["file_id"]
+                    f_name = document.get("file_name", "") if document else ""
+                    ext = "." + f_name.split(".")[-1] if "." in f_name else ".file" if document else ".jpg"
+                    
+                    logger.info("Скачиваем файл из Telegram...")
+                    dl_path = await download_tg_file(file_id, ext)
+                    if not dl_path:
+                        await asyncio.get_running_loop().run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, "❌ <b>Ошибка: Не удалось скачать файл из Telegram.</b>")
+                        return
+
+                logger.info(f"Отправка в MAX (target_id: {target_id}, медиа: {'Да' if dl_path else 'Нет'})")
+                if text: RECENT_SENT_TEXTS.append(text)
                 
                 try:
-                    success = False
-                    if hasattr(client, "send_message"): 
-                        await client.send_message(text, target_id)
-                        success = True
-                    elif hasattr(client, "send_text"): 
-                        await client.send_text(text, target_id)
-                        success = True
-                    else: 
-                        logger.error("В PyMax нет методов отправки.")
-
-                    # --- ЕСЛИ ОТПРАВЛЕНО УСПЕШНО, СТАВИМ ЛАЙК В ТГ ---
+                    success = await send_to_max_wrapper(target_id, text, dl_path)
                     if success and message_id:
                         loop = asyncio.get_running_loop()
                         await loop.run_in_executor(None, set_telegram_reaction, TG_CHAT_ID, message_id, "👍")
-
                 except Exception as e:
                     logger.error(f"Ошибка отправки ответа в MAX: {e}")
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, f"❌ <b>Ошибка отправки в MAX:</b> <code>{e}</code>")
+                    await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, f"❌ <b>Ошибка отправки:</b> <code>{e}</code>")
+                finally:
+                    if dl_path and os.path.exists(dl_path): os.remove(dl_path) 
+                    
     except Exception as e: logger.error(f"Сбой логики обработки ответа: {e}")
 
 
 async def handle_tg_command(msg):
     text, thread_id = msg.get("text", "").strip(), msg.get("message_thread_id")
     command = text.split("@")[0].lower()
-    
-    if command == "/status":
+    loop = asyncio.get_running_loop()
+
+    # --- УМНАЯ КОМАНДА АЛИАСОВ (АВТО-ID) ---
+    if command.startswith("/alias"):
+        parts = text.split(maxsplit=1)
+        if not thread_id:
+            reply = "❌ Эту команду нужно отправлять **строго внутри топика**, который вы хотите переименовать."
+            await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, None, reply)
+            return
+
+        if len(parts) < 2:
+            reply = "❌ **Использование:**\n`/alias <Желаемое Имя>`\n<i>Пример: /alias Иван Директор</i>"
+            await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+            return
+            
+        new_alias = parts[1].strip()
+        db_cursor.execute("SELECT max_chat_id, type FROM topics WHERE thread_id = ?", (thread_id,))
+        topic_row = db_cursor.fetchone()
+
+        if not topic_row:
+            reply = "❌ Ошибка: Этот топик не привязан ни к одному чату MAX в базе данных."
+            await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+            return
+
+        raw_target, m_type = topic_row
+        target_id = raw_target.replace("PRIVATE_", "") if m_type == "private" and raw_target.startswith("PRIVATE_") else raw_target
+
+        try:
+            db_cursor.execute("INSERT OR REPLACE INTO contacts (max_id, alias) VALUES (?, ?)", (target_id, new_alias))
+            ok, _ = await loop.run_in_executor(None, tg_api_call, "editForumTopic", {"chat_id": TG_CHAT_ID, "message_thread_id": thread_id, "name": new_alias[:128]})
+            if ok:
+                db_cursor.execute("UPDATE topics SET name = ? WHERE thread_id = ?", (new_alias, thread_id))
+                db_conn.commit()
+                reply = f"✅ Топик и контакт успешно переименованы в: <b>{new_alias}</b>"
+            else:
+                db_conn.commit()
+                reply = f"⚠️ Алиас сохранен (<b>{new_alias}</b>), но не удалось переименовать топик в ТГ."
+        except Exception as e:
+            reply = f"❌ Ошибка при сохранении алиаса: {e}"
+
+        await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+
+    elif command == "/status":
         max_status = "🔴 Офлайн"
         try:
             await asyncio.wait_for(client.get_user(543835), timeout=5.0)
@@ -612,7 +655,7 @@ async def handle_tg_command(msg):
             dlq_count = db_cursor.fetchone()[0]
         except Exception: q_count, dlq_count = "?", "?"
         reply = f"📊 <b>Статус Telemax</b>\n\n🔌 MAX API: {max_status}\n🚀 Telegram: 🟢 Онлайн\n📨 В очереди: <b>{q_count}</b> шт.\n⚠️ Ошибки (DLQ): <b>{dlq_count}</b> шт.\n⏱ Последнее от MAX: <code>{global_last_msg_time}</code>"
-        await asyncio.get_running_loop().run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+        await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
 
     elif command == "/dlq":
         try:
@@ -640,7 +683,7 @@ async def handle_tg_command(msg):
                 if total_count > 20: lines.append(f"\n<i>...и еще {total_count - 20} (показаны 20).</i>")
                 reply = "\n".join(lines)
         except Exception as e: reply = f"❌ Ошибка БД: {e}"
-        await asyncio.get_running_loop().run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+        await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
 
     elif command == "/clear_dlq":
         try:
@@ -655,7 +698,7 @@ async def handle_tg_command(msg):
             db_conn.commit()
             reply = "🗑 <b>DLQ очищена!</b> \nМедиа удалены с диска."
         except Exception as e: reply = f"❌ Ошибка: {e}"
-        await asyncio.get_running_loop().run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
+        await loop.run_in_executor(None, send_telegram_message, TG_CHAT_ID, thread_id, reply)
 
 async def watchdog_worker():
     systemd_notify("READY=1")
