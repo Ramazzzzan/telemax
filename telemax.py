@@ -34,8 +34,8 @@ except Exception as e:
 RECENT_SENT_TEXTS = collections.deque(maxlen=50)
 SERVER_NAME = "Telemax"
 
-from pymax import SocketMaxClient, Message
-from pymax.payloads import UserAgentPayload
+# --- ИМПОРТ PYMAX 2.4.1 ---
+from pymax import Client, Message
 
 # --- ПОДГОТОВКА ПАПОК И БАЗЫ ДАННЫХ ---
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +77,7 @@ def enqueue_v2(item_type, max_chat_id, thread_id, text_data, file_data=None):
         db_cursor.execute("INSERT INTO queue_v2 (type, max_chat_id, thread_id, text_data, file_data) VALUES (?, ?, ?, ?, ?)",
                           (item_type, str(max_chat_id), thread_id, text_data, file_data))
         db_conn.commit()
-        queue_event.set() # Будим очередь моментально!
+        queue_event.set()
     except Exception as e:
         logger.error(f"DB Insert Error: {e}")
 
@@ -223,11 +223,14 @@ async def download_tg_file(file_id, ext=".jpg"):
 async def brutal_download(client_instance, attach, download_path):
     url_to_download = None
     try:
-        if hasattr(client_instance, "get_file_url"): url_to_download = await client_instance.get_file_url(attach)
+        if hasattr(attach, "get_url"):
+            url_to_download = await attach.get_url() if asyncio.iscoroutinefunction(attach.get_url) else attach.get_url()
+        elif hasattr(client_instance, "get_file_url"):
+            url_to_download = await client_instance.get_file_url(attach)
     except: pass
+
     if not url_to_download:
         actual_id, token = None, attach.get('token') if isinstance(attach, dict) else getattr(attach, 'token', None)
-        # Фикс для файлов: перебираем все возможные ID, включая file_id для документов
         for attr_name in ['file_id', 'video_id', 'image_id', 'audio_id', 'id']:
             val = attach.get(attr_name) if isinstance(attach, dict) else getattr(attach, attr_name, None)
             if val:
@@ -235,17 +238,20 @@ async def brutal_download(client_instance, attach, download_path):
         if actual_id:
             file_id_str = f"{actual_id}?token={token}" if token else f"{actual_id}"
             try:
-                if hasattr(client_instance, "_api") and hasattr(client_instance._api, "get_file"):
-                    file_content = await client_instance._api.get_file(file_id_str)
+                api_obj = getattr(client_instance, "api", getattr(client_instance, "_api", None))
+                if api_obj and hasattr(api_obj, "get_file"):
+                    file_content = await api_obj.get_file(file_id_str)
                     if file_content:
                         with open(download_path, 'wb') as f: f.write(file_content)
                         return True
             except: pass
+
     if not url_to_download:
         for attr in ['url', 'file_url', 'download_url', 'source', 'link', 'href', 'base_url']:
             val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
             if isinstance(val, str) and val.startswith("http"):
                 url_to_download = val; break
+
     if url_to_download:
         try:
             def do_download():
@@ -258,6 +264,7 @@ async def brutal_download(client_instance, attach, download_path):
                     return False
             if await asyncio.get_running_loop().run_in_executor(None, do_download): return True
         except: pass
+
     for attr in ['bytes', 'file_bytes', 'data', 'content']:
         val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
         if isinstance(val, bytes):
@@ -265,15 +272,12 @@ async def brutal_download(client_instance, attach, download_path):
             return True
     return False
 
-ua = UserAgentPayload(device_type="DESKTOP")
-client = SocketMaxClient(phone=MAX_PHONE, work_dir="session_cache", headers=ua)
-async def fake_send_navigation_event(*args, **kwargs): pass
-client._send_navigation_event = fake_send_navigation_event
-client.send_navigation_event = fake_send_navigation_event
+# --- ИНИЦИАЛИЗАЦИЯ КЛИЕНТА PYMAX 2.4.1 ---
+client = Client(phone=MAX_PHONE, work_dir="session_cache")
 message_queue = asyncio.Queue()
 
 @client.on_message()
-async def handle_message(message: Message) -> None:
+async def handle_message(message: Message, client=None) -> None:
     await message_queue.put(message)
 
 async def tg_forward_worker():
@@ -300,7 +304,6 @@ async def process_and_enqueue(message: Message) -> None:
     if MY_MAX_ID and sender_id == MY_MAX_ID: return
     if msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or getattr(message, "action", None): return
 
-    # --- ИЩЕМ АЛИАС В БД ИЛИ ЗАПРАШИВАЕМ СЕРВЕР ---
     sender_name = "Неизвестный"
     if sender_id is not None:
         db_cursor.execute("SELECT alias FROM contacts WHERE max_id = ?", (str(sender_id),))
@@ -336,7 +339,6 @@ async def process_and_enqueue(message: Message) -> None:
         topic_target_id = f"PRIVATE_{target}" if target else "PRIVATE_UNKNOWN"
         m_type = "private"
         
-        # Если есть алиас для этого диалога, используем его для имени топика
         db_cursor.execute("SELECT alias FROM contacts WHERE max_id = ?", (str(target),))
         topic_alias_row = db_cursor.fetchone()
         
@@ -351,7 +353,6 @@ async def process_and_enqueue(message: Message) -> None:
     db_cursor.execute("SELECT thread_id, name FROM topics WHERE max_chat_id = ?", (topic_target_id,))
     row = db_cursor.fetchone()
     
-    # Авто-переименование существующего топика, если алиас изменился
     if row: 
         thread_id, old_topic_name = row
         if old_topic_name != topic_name:
@@ -446,7 +447,7 @@ async def process_and_enqueue(message: Message) -> None:
     if not downloaded_files and not caption_assigned:
         enqueue_v2("text", chat_id, thread_id, full_caption, None)
 
-# --- ИНСТАНТНАЯ ОЧЕРЕДЬ (БЕЗ ЗАДЕРЖЕК) ---
+# --- ИНСТАНТНАЯ ОЧЕРЕДЬ ---
 async def queue_processor():
     loop = asyncio.get_running_loop()
     retry_counts = {}
@@ -490,7 +491,6 @@ async def queue_processor():
                         retry_counts.pop(qid, None)
                     else: await asyncio.sleep(min(300, 5 * (2 ** (retry_counts[qid] - 1))))
             else:
-                # Мгновенно засыпаем до появления новой задачи
                 queue_event.clear()
                 try: await asyncio.wait_for(queue_event.wait(), timeout=5.0)
                 except asyncio.TimeoutError: pass
@@ -596,13 +596,11 @@ async def handle_tg_reply_to_max(msg):
                     
     except Exception as e: logger.error(f"Сбой логики обработки ответа: {e}")
 
-
 async def handle_tg_command(msg):
     text, thread_id = msg.get("text", "").strip(), msg.get("message_thread_id")
     command = text.split("@")[0].lower()
     loop = asyncio.get_running_loop()
 
-    # --- УМНАЯ КОМАНДА АЛИАСОВ (АВТО-ID) ---
     if command.startswith("/alias"):
         parts = text.split(maxsplit=1)
         if not thread_id:
@@ -723,7 +721,10 @@ async def watchdog_worker():
 
 async def main() -> None:
     logger.info("Запуск Bridge...")
-    wt, qt, wdt, pt = asyncio.create_task(tg_forward_worker()), asyncio.create_task(queue_processor()), asyncio.create_task(watchdog_worker()), asyncio.create_task(tg_command_polling())
+    wt = asyncio.create_task(tg_forward_worker())
+    qt = asyncio.create_task(queue_processor())
+    wdt = asyncio.create_task(watchdog_worker())
+    pt = asyncio.create_task(tg_command_polling())
     try:
         await client.start()
         await asyncio.Event().wait()
