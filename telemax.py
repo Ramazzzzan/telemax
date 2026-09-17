@@ -293,6 +293,59 @@ async def brutal_download(client_instance, attach, download_path):
             return True
     return False
 
+# --- HELPER: ADVANCED CHAT TITLE RESOLUTION ---
+async def resolve_chat_title(client_instance, message: Message, chat_id) -> str:
+    # 1. Direct message attribute checks
+    for attr in ["chat_title", "title", "chat_name"]:
+        val = getattr(message, attr, None)
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # 2. Direct message.chat object checks
+    chat_obj = getattr(message, "chat", None)
+    if chat_obj:
+        for attr in ["title", "name", "chat_name"]:
+            val = getattr(chat_obj, attr, None)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+
+    # 3. Active client lookup fallback
+    if chat_id:
+        try:
+            target_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
+            ci = await asyncio.wait_for(client_instance.get_chat(target_id), timeout=5.0)
+            if ci:
+                for attr in ["title", "name", "chat_name"]:
+                    val = getattr(ci, attr, None)
+                    if val and isinstance(val, str) and val.strip():
+                        return val.strip()
+        except Exception: pass
+
+    return None
+
+# --- HELPER: SYSTEM & CHAT EVENT PARSER ---
+def parse_system_event(message: Message, msg_type_raw: str) -> str:
+    action_type = str(getattr(message, "action", "") or getattr(message, "event_type", "") or getattr(message, "event", "") or "").upper()
+    
+    # Event translations dictionary
+    action_map = {
+        "USER_ADDED": "пользователь добавлен в чат",
+        "USER_JOINED": "пользователь присоединился к чату",
+        "USER_LEFT": "пользователь покинул чат",
+        "USER_REMOVED": "пользователь удален из чата",
+        "CHAT_TITLE_CHANGED": "название чата изменено",
+        "CHAT_ICON_CHANGED": "иконка чата изменена",
+        "MESSAGE_PINNED": "сообщение закреплено",
+        "MESSAGE_UNPINNED": "сообщение откреплено",
+        "JOIN_BY_LINK": "пользователь вошел по ссылке"
+    }
+    
+    raw_text = str(getattr(message, "text", "") or getattr(message, "caption", "") or "").strip()
+    if raw_text == "None": raw_text = ""
+
+    desc = action_map.get(action_type, raw_text if raw_text else f"Событие чата ({action_type or msg_type_raw})")
+    return f"ℹ️ <i>[Системное уведомление]: {desc}</i>"
+
 # --- CLIENT INIT & HANDLERS ---
 client = Client(phone=MAX_PHONE, work_dir=str(WORK_DIR / "session_cache"))
 message_queue = asyncio.Queue()
@@ -321,8 +374,8 @@ async def process_and_enqueue(message: Message) -> None:
     if t and t in RECENT_SENT_TEXTS: return
     if getattr(message, "out", False) or getattr(message, "outgoing", False) or getattr(message, "is_out", False): return
     if MY_MAX_ID and sender_id == MY_MAX_ID: return
-    if msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or getattr(message, "action", None): return
 
+    # --- SENDER NAME RESOLUTION ---
     sender_name = "Неизвестный"
     if sender_id is not None:
         alias_row = await db.fetchone("SELECT alias FROM contacts WHERE max_id = ?", (str(sender_id),))
@@ -338,16 +391,11 @@ async def process_and_enqueue(message: Message) -> None:
             except: sender_name = f"ID:{sender_id}"
     elif msg_type_raw == "CHANNEL": sender_name = "Канал"
 
-    chat_title = getattr(message, "chat_title", None) or getattr(message, "title", None)
-    if not chat_title and getattr(message, "chat", None): chat_title = getattr(message.chat, "title", None) or getattr(message.chat, "name", None)
-    if not chat_title and chat_id:
-        try:
-            ci = await asyncio.wait_for(client.get_chat(str(chat_id)), timeout=5.0)
-            if ci: chat_title = getattr(ci, "title", None) or getattr(ci, "name", None)
-        except: pass
-
+    # --- ADVANCED CHAT TITLE RESOLUTION ---
+    chat_title = await resolve_chat_title(client, message, chat_id)
     if msg_type_raw == "CHANNEL" and sender_name == "Канал" and chat_title: sender_name = chat_title
 
+    # --- PRIVATE VS GROUP CLASSIFICATION ---
     is_private = False
     if msg_type_raw in ["PRIVATE", "BOT"]: is_private = True
     elif msg_type_raw == "USER": is_private = not (chat_id and str(chat_id).startswith("-"))
@@ -368,12 +416,12 @@ async def process_and_enqueue(message: Message) -> None:
         clean_id = topic_target_id.lstrip("-")
         topic_name = chat_title if chat_title else f"Группа {clean_id}"
 
-    # Search existing topic by normalized target ID
+    # Query existing topic by normalized target ID
     row = await db.fetchone("SELECT thread_id, name FROM topics WHERE max_chat_id = ? OR max_chat_id = ?", (topic_target_id, topic_target_id.lstrip("-")))
     
     if row:
         thread_id, old_topic_name = row["thread_id"], row["name"]
-        # Upgrade topic title if previous title was generic and a valid title arrived
+        # Automatically upgrade generic fallback titles when a real title becomes available
         if chat_title and old_topic_name.startswith("Группа ") and not chat_title.startswith("Группа "):
             ok, _ = await tg_api_call("editForumTopic", {"chat_id": TG_CHAT_ID, "message_thread_id": thread_id, "name": chat_title[:128]})
             if ok:
@@ -388,12 +436,21 @@ async def process_and_enqueue(message: Message) -> None:
 
     header = f"[{sender_name}]:" if (is_private or not chat_title or chat_title == sender_name) else f"[{chat_title}], [{sender_name}]:"
     text_parts, all_attachments, forward_prefix = [], [], ""
-    
-    if t and t != "None": text_parts.append(t)
+
+    # --- SYSTEM / CHAT EVENT HANDLING ---
+    is_service_event = msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or bool(getattr(message, "action", None))
+    if is_service_event:
+        event_notice = parse_system_event(message, msg_type_raw)
+        text_parts.append(event_notice)
+    elif t and t != "None":
+        text_parts.append(t)
+
+    # --- ATTACHMENTS PROCESSING ---
     for attr in ["attaches", "attachments", "document", "video", "photo", "sticker", "voice"]:
         val = getattr(message, attr, None)
         if val: all_attachments.extend(val) if isinstance(val, list) else all_attachments.append(val)
 
+    # --- FORWARDED MESSAGES PROCESSING ---
     link_obj = getattr(message, "link", None)
     if link_obj and getattr(link_obj, "type", None) == "FORWARD":
         nested_msg = getattr(link_obj, "message", None)
