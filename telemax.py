@@ -200,8 +200,8 @@ async def send_telegram_media(chat_id, thread_id, text, file_info):
     if thread_id: params["message_thread_id"] = thread_id
     field, timeout_sec = "document", 300
     if ext in [".jpg", ".jpeg", ".png", ".webp"]: field, timeout_sec = "photo", 60
-    elif ext == ".ogg": field, timeout_sec = "voice", 60
-    elif ext == ".mp4": field, timeout_sec = "video", 300
+    elif ext in [".ogg", ".oga", ".opus"]: field, timeout_sec = "voice", 60
+    elif ext in [".mp4", ".mov"]: field, timeout_sec = "video", 300
     return await tg_api_call(f"send{field.capitalize()}", params=params, files={field: file_path}, timeout=timeout_sec)
 
 async def send_telegram_album(chat_id, thread_id, text, files_info):
@@ -210,7 +210,7 @@ async def send_telegram_album(chat_id, thread_id, text, files_info):
     media_group, files_dict = [], {}
     for i, f_info in enumerate(valid_files):
         files_dict[f"file{i}"] = f_info["path"]
-        item = {"type": "video" if f_info["ext"] == ".mp4" else "photo", "media": f"attach://file{i}"}
+        item = {"type": "video" if f_info["ext"] in [".mp4", ".mov"] else "photo", "media": f"attach://file{i}"}
         if i == 0 and text: item.update({"caption": text, "parse_mode": "HTML"})
         media_group.append(item)
     params = {"chat_id": chat_id, "media": json.dumps(media_group, ensure_ascii=False)}
@@ -247,10 +247,31 @@ async def download_tg_file(file_id, ext=".jpg"):
             cmd = ["curl", "-sS", "-x", "socks5h://127.0.0.1:10808", "--max-time", "60", "-o", str(dl_path), f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_path}"]
             proc = await asyncio.create_subprocess_exec(*cmd)
             await proc.communicate()
-            if dl_path.exists(): return str(dl_path)
+            if dl_path.exists() and dl_path.stat().st_size > 0: return str(dl_path)
     return None
 
 async def brutal_download(client_instance, attach, download_path):
+    # 1. Попытка нативного скачивания через методы pymax
+    if not isinstance(attach, dict):
+        for dl_method_name in ["download", "save"]:
+            if hasattr(attach, dl_method_name):
+                try:
+                    method = getattr(attach, dl_method_name)
+                    res = await method(destination=download_path) if asyncio.iscoroutinefunction(method) else method(destination=download_path)
+                    if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
+                        return True
+                except Exception: pass
+
+        for cl_method_name in ["download_file", "download_media", "download_attachment"]:
+            if hasattr(client_instance, cl_method_name):
+                try:
+                    method = getattr(client_instance, cl_method_name)
+                    await method(attach, destination=download_path)
+                    if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
+                        return True
+                except Exception: pass
+
+    # 2. Получение прямых URL скачивания
     url_to_download = None
     try:
         if hasattr(attach, "get_url"):
@@ -259,11 +280,13 @@ async def brutal_download(client_instance, attach, download_path):
             url_to_download = await client_instance.get_file_url(attach)
     except: pass
 
+    # 3. Извлечение ID и токена для API запроса get_file
     if not url_to_download:
         actual_id, token = None, attach.get('token') if isinstance(attach, dict) else getattr(attach, 'token', None)
-        for attr_name in ['file_id', 'video_id', 'image_id', 'audio_id', 'id']:
+        for attr_name in ['file_id', 'photo_id', 'video_id', 'audio_id', 'sticker_id', 'id']:
             val = attach.get(attr_name) if isinstance(attach, dict) else getattr(attach, attr_name, None)
             if val: actual_id = val; break
+            
         if actual_id:
             file_id_str = f"{actual_id}?token={token}" if token else f"{actual_id}"
             try:
@@ -275,41 +298,40 @@ async def brutal_download(client_instance, attach, download_path):
                         return True
             except: pass
 
+    # 4. Поиск прямого URL в атрибутах объекта
     if not url_to_download:
         for attr in ['url', 'file_url', 'download_url', 'source', 'link', 'href', 'base_url']:
             val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
             if isinstance(val, str) and val.startswith("http"): url_to_download = val; break
 
+    # 5. Скачивание по URL через curl с прокси
     if url_to_download:
-        cmd = ["curl", "-sS", "-L", "-A", "Mozilla/5.0", "--max-time", "300", "-o", str(download_path), url_to_download]
+        cmd = ["curl", "-sS", "-L", "-x", "socks5h://127.0.0.1:10808", "-A", "Mozilla/5.0", "--max-time", "300", "-o", str(download_path), url_to_download]
         proc = await asyncio.create_subprocess_exec(*cmd)
         await proc.communicate()
         if os.path.exists(download_path) and os.path.getsize(download_path) > 0: return True
 
+    # 6. Извлечение из байтового буфера
     for attr in ['bytes', 'file_bytes', 'data', 'content']:
         val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
         if isinstance(val, bytes):
             with open(download_path, 'wb') as f: f.write(val)
             return True
+            
     return False
 
 # --- HELPER: ADVANCED CHAT TITLE RESOLUTION ---
 async def resolve_chat_title(client_instance, message: Message, chat_id) -> str:
-    # 1. Direct message attribute checks
     for attr in ["chat_title", "title", "chat_name"]:
         val = getattr(message, attr, None)
-        if val and isinstance(val, str) and val.strip():
-            return val.strip()
+        if val and isinstance(val, str) and val.strip(): return val.strip()
 
-    # 2. Direct message.chat object checks
     chat_obj = getattr(message, "chat", None)
     if chat_obj:
         for attr in ["title", "name", "chat_name"]:
             val = getattr(chat_obj, attr, None)
-            if val and isinstance(val, str) and val.strip():
-                return val.strip()
+            if val and isinstance(val, str) and val.strip(): return val.strip()
 
-    # 3. Active client lookup fallback
     if chat_id:
         try:
             target_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)
@@ -317,8 +339,7 @@ async def resolve_chat_title(client_instance, message: Message, chat_id) -> str:
             if ci:
                 for attr in ["title", "name", "chat_name"]:
                     val = getattr(ci, attr, None)
-                    if val and isinstance(val, str) and val.strip():
-                        return val.strip()
+                    if val and isinstance(val, str) and val.strip(): return val.strip()
         except Exception: pass
 
     return None
@@ -326,8 +347,6 @@ async def resolve_chat_title(client_instance, message: Message, chat_id) -> str:
 # --- HELPER: SYSTEM & CHAT EVENT PARSER ---
 def parse_system_event(message: Message, msg_type_raw: str) -> str:
     action_type = str(getattr(message, "action", "") or getattr(message, "event_type", "") or getattr(message, "event", "") or "").upper()
-    
-    # Event translations dictionary
     action_map = {
         "USER_ADDED": "пользователь добавлен в чат",
         "USER_JOINED": "пользователь присоединился к чату",
@@ -339,10 +358,8 @@ def parse_system_event(message: Message, msg_type_raw: str) -> str:
         "MESSAGE_UNPINNED": "сообщение откреплено",
         "JOIN_BY_LINK": "пользователь вошел по ссылке"
     }
-    
     raw_text = str(getattr(message, "text", "") or getattr(message, "caption", "") or "").strip()
     if raw_text == "None": raw_text = ""
-
     desc = action_map.get(action_type, raw_text if raw_text else f"Событие чата ({action_type or msg_type_raw})")
     return f"ℹ️ <i>[Системное уведомление]: {desc}</i>"
 
@@ -391,7 +408,7 @@ async def process_and_enqueue(message: Message) -> None:
             except: sender_name = f"ID:{sender_id}"
     elif msg_type_raw == "CHANNEL": sender_name = "Канал"
 
-    # --- ADVANCED CHAT TITLE RESOLUTION ---
+    # --- CHAT TITLE RESOLUTION ---
     chat_title = await resolve_chat_title(client, message, chat_id)
     if msg_type_raw == "CHANNEL" and sender_name == "Канал" and chat_title: sender_name = chat_title
 
@@ -416,12 +433,10 @@ async def process_and_enqueue(message: Message) -> None:
         clean_id = topic_target_id.lstrip("-")
         topic_name = chat_title if chat_title else f"Группа {clean_id}"
 
-    # Query existing topic by normalized target ID
     row = await db.fetchone("SELECT thread_id, name FROM topics WHERE max_chat_id = ? OR max_chat_id = ?", (topic_target_id, topic_target_id.lstrip("-")))
     
     if row:
         thread_id, old_topic_name = row["thread_id"], row["name"]
-        # Automatically upgrade generic fallback titles when a real title becomes available
         if chat_title and old_topic_name.startswith("Группа ") and not chat_title.startswith("Группа "):
             ok, _ = await tg_api_call("editForumTopic", {"chat_id": TG_CHAT_ID, "message_thread_id": thread_id, "name": chat_title[:128]})
             if ok:
@@ -440,8 +455,7 @@ async def process_and_enqueue(message: Message) -> None:
     # --- SYSTEM / CHAT EVENT HANDLING ---
     is_service_event = msg_type_raw in ["SERVICE", "SYSTEM", "EVENT", "ACTION"] or bool(getattr(message, "action", None))
     if is_service_event:
-        event_notice = parse_system_event(message, msg_type_raw)
-        text_parts.append(event_notice)
+        text_parts.append(parse_system_event(message, msg_type_raw))
     elif t and t != "None":
         text_parts.append(t)
 
@@ -450,7 +464,7 @@ async def process_and_enqueue(message: Message) -> None:
         val = getattr(message, attr, None)
         if val: all_attachments.extend(val) if isinstance(val, list) else all_attachments.append(val)
 
-    # --- FORWARDED MESSAGES PROCESSING ---
+    # --- FORWARDED MESSAGES ---
     link_obj = getattr(message, "link", None)
     if link_obj and getattr(link_obj, "type", None) == "FORWARD":
         nested_msg = getattr(link_obj, "message", None)
@@ -477,20 +491,17 @@ async def process_and_enqueue(message: Message) -> None:
     if all_attachments:
         for attach in all_attachments:
             try:
-                f_id = attach.get("id", str(id(attach))) if isinstance(attach, dict) else getattr(attach, "id", str(id(attach)))
+                f_id = attach.get("id", str(id(attach))) if isinstance(attach, dict) else getattr(attach, "id", getattr(attach, "file_id", str(id(attach))))
                 f_name = attach.get("name", "") if isinstance(attach, dict) else getattr(attach, "name", "")
                 a_type = str(attach.get("type", "") if isinstance(attach, dict) else getattr(attach, "type", "")).upper()
                 c_name = str(attach.get("__class__", "")) if isinstance(attach, dict) else getattr(attach.__class__, "__name__", "")
                 ext = "." + f_name.split(".")[-1] if f_name and "." in f_name else ".mp4" if "VIDEO" in a_type or "Video" in c_name else ".mp3" if "AUDIO" in a_type or "Audio" in c_name else ".ogg" if "VOICE" in a_type or "Voice" in c_name else ".webp" if "STICKER" in a_type or "Sticker" in c_name else ".jpg" if "PHOTO" in a_type or "IMAGE" in a_type or "Photo" in c_name else ".file"
                 dl_path = str(TEMP_DOWNLOAD_DIR / f"{f_id}{ext}")
-                is_dl = os.path.exists(dl_path)
-                if not is_dl and not isinstance(attach, dict):
-                    try:
-                        if hasattr(client, "download_media"): await client.download_media(attach, out_dir=str(TEMP_DOWNLOAD_DIR), file_name=f"{f_id}{ext}")
-                        elif hasattr(attach, "download"): await attach.download(out_dir=str(TEMP_DOWNLOAD_DIR), file_name=f"{f_id}{ext}")
-                    except: pass
-                is_dl = os.path.exists(dl_path)
-                if not is_dl: is_dl = await brutal_download(client, attach, dl_path)
+                
+                is_dl = os.path.exists(dl_path) and os.path.getsize(dl_path) > 0
+                if not is_dl:
+                    is_dl = await brutal_download(client, attach, dl_path)
+                    
                 if is_dl: downloaded_files.append({"path": dl_path, "ext": ext})
                 else: body_text += f"\n\n<i>[Ошибка: Вложение {ext} не скачалось]</i>"
             except Exception as e: logger.error(f"Attachment error: {e}")
@@ -584,25 +595,33 @@ async def tg_command_polling():
             else: await asyncio.sleep(2)
         except Exception: await asyncio.sleep(5)
 
+# --- ИСПРАВЛЕННЫЙ МЕТОД ОТПРАВКИ СООБЩЕНИЙ В МАКС ---
 async def send_to_max_wrapper(target_id, text, dl_path=None):
     success = False
+    
+    # 1. Отправка медиафайла (если есть)
     if dl_path:
         for method_name in ["send_media", "send_file", "send_document", "send_photo"]:
             if hasattr(client, method_name):
                 method = getattr(client, method_name)
                 try: 
                     await method(target_id, dl_path)
-                    success = True; break
+                    success = True
+                    break
                 except Exception:
                     try: 
-                        await method(dl_path, target_id)
-                        success = True; break
+                        await method(chat_id=target_id, file=dl_path)
+                        success = True
+                        break
                     except Exception: pass
 
+    # 2. Отправка текста (с исправленным порядком аргументов: chat_id первый, text второй)
     if text and (success or not dl_path):
         try:
-            if hasattr(client, "send_message"): await client.send_message(text, target_id)
-            elif hasattr(client, "send_text"): await client.send_text(text, target_id)
+            if hasattr(client, "send_message"):
+                await client.send_message(chat_id=target_id, text=text)
+            elif hasattr(client, "send_text"):
+                await client.send_text(chat_id=target_id, text=text)
             success = True
         except Exception as e:
             if not dl_path: raise e 
