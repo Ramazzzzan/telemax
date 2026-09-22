@@ -660,7 +660,7 @@ async def handle_tg_reply_to_max(msg):
                 try:
                     success = await send_to_max_wrapper(target_id, text, dl_path)
                     if success and message_id:
-                        await set_telegram_reaction(TG_CHAT_ID, message_id, "👍")
+                        await set_telegram_reaction(TG_CHAT_ID, message_id, "✅")
                 except Exception as e:
                     logger.error(f"Error sending reply to MAX: {e}")
                     await send_telegram_message(TG_CHAT_ID, thread_id, f"❌ <b>Ошибка отправки:</b> <code>{e}</code>")
