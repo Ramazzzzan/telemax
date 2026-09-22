@@ -160,7 +160,7 @@ async def send_push(msg, tags="warning", priority=3):
         except Exception: pass
     await asyncio.to_thread(_post)
 
-# --- ASYNC TELEGRAM API ENGINE ---
+# --- ASYNC TELEGRAM API ENGINE (ВСЕГДА ЧЕРЕЗ SOCKS5 ПРОКСИ) ---
 async def tg_api_call(method: str, params: dict = None, files: dict = None, timeout: int = 60):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
     cmd = ["curl", "-sS", "-x", "socks5h://127.0.0.1:10808", "--max-time", str(timeout)]
@@ -237,7 +237,7 @@ async def update_status_message(text):
                 await tg_api_call("pinChatMessage", params={"chat_id": TG_CHAT_ID, "message_id": new_id, "disable_notification": "true"})
     except Exception: pass
 
-# --- FILE TRANSFER PIPELINE ---
+# --- СКАЧИВАНИЕ ФАЙЛОВ ИЗ TELEGRAM (ЧЕРЕЗ ПРОКСИ) ---
 async def download_tg_file(file_id, ext=".jpg"):
     ok, data = await tg_api_call("getFile", {"file_id": file_id})
     if ok is True and isinstance(data, dict):
@@ -250,28 +250,29 @@ async def download_tg_file(file_id, ext=".jpg"):
             if dl_path.exists() and dl_path.stat().st_size > 0: return str(dl_path)
     return None
 
+# --- СКАЧИВАНИЕ ФАЙЛОВ ИЗ MAX (СТРОГО НАПРЯМУЮ, БЕЗ ПРОКСИ!) ---
 async def brutal_download(client_instance, attach, download_path):
-    # 1. Попытка нативного скачивания через методы pymax
+    # 1. Нативное скачивание через методы объекта вложения в pymax
     if not isinstance(attach, dict):
-        for dl_method_name in ["download", "save"]:
-            if hasattr(attach, dl_method_name):
+        for dl_method in ["download", "save"]:
+            if hasattr(attach, dl_method):
                 try:
-                    method = getattr(attach, dl_method_name)
-                    res = await method(destination=download_path) if asyncio.iscoroutinefunction(method) else method(destination=download_path)
+                    m = getattr(attach, dl_method)
+                    res = await m(destination=download_path) if asyncio.iscoroutinefunction(m) else m(destination=download_path)
                     if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
                         return True
                 except Exception: pass
 
-        for cl_method_name in ["download_file", "download_media", "download_attachment"]:
-            if hasattr(client_instance, cl_method_name):
+        for cl_method in ["download_file", "download_media", "download_attachment"]:
+            if hasattr(client_instance, cl_method):
                 try:
-                    method = getattr(client_instance, cl_method_name)
-                    await method(attach, destination=download_path)
+                    m = getattr(client_instance, cl_method)
+                    await m(attach, destination=download_path)
                     if os.path.exists(download_path) and os.path.getsize(download_path) > 0:
                         return True
                 except Exception: pass
 
-    # 2. Получение прямых URL скачивания
+    # 2. Получение прямой ссылки на файл из MAX
     url_to_download = None
     try:
         if hasattr(attach, "get_url"):
@@ -298,20 +299,20 @@ async def brutal_download(client_instance, attach, download_path):
                         return True
             except: pass
 
-    # 4. Поиск прямого URL в атрибутах объекта
+    # 4. Поиск прямой ссылки в полях атрибутов
     if not url_to_download:
         for attr in ['url', 'file_url', 'download_url', 'source', 'link', 'href', 'base_url']:
             val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
             if isinstance(val, str) and val.startswith("http"): url_to_download = val; break
 
-    # 5. Скачивание по URL через curl с прокси
+    # 5. Скачивание прямой ссылки с CDN MAX НАПРЯМУЮ (БЕЗ -x SOCKS5 ПРОКСИ!)
     if url_to_download:
-        cmd = ["curl", "-sS", "-L", "-x", "socks5h://127.0.0.1:10808", "-A", "Mozilla/5.0", "--max-time", "300", "-o", str(download_path), url_to_download]
+        cmd = ["curl", "-sS", "-L", "-A", "Mozilla/5.0", "--max-time", "300", "-o", str(download_path), url_to_download]
         proc = await asyncio.create_subprocess_exec(*cmd)
         await proc.communicate()
         if os.path.exists(download_path) and os.path.getsize(download_path) > 0: return True
 
-    # 6. Извлечение из байтового буфера
+    # 6. Извлечение байтов из памяти (если переданы)
     for attr in ['bytes', 'file_bytes', 'data', 'content']:
         val = attach.get(attr) if isinstance(attach, dict) else getattr(attach, attr, None)
         if isinstance(val, bytes):
@@ -363,7 +364,7 @@ def parse_system_event(message: Message, msg_type_raw: str) -> str:
     desc = action_map.get(action_type, raw_text if raw_text else f"Событие чата ({action_type or msg_type_raw})")
     return f"ℹ️ <i>[Системное уведомление]: {desc}</i>"
 
-# --- CLIENT INIT & HANDLERS ---
+# --- CLIENT INIT & HANDLERS (MAX ПОДКЛЮЧАЕТСЯ НАПРЯМУЮ) ---
 client = Client(phone=MAX_PHONE, work_dir=str(WORK_DIR / "session_cache"))
 message_queue = asyncio.Queue()
 
@@ -575,7 +576,7 @@ async def queue_processor():
                 except asyncio.TimeoutError: pass
         except Exception: await asyncio.sleep(5.0)
 
-# --- TELEGRAM LONG POLLING & COMMANDS ---
+# --- TELEGRAM LONG POLLING & COMMANDS (ЧЕРЕЗ ПРОКСИ) ---
 async def tg_command_polling():
     offset = 0
     logger.info("Starting Telegram Long Polling module...")
@@ -595,11 +596,11 @@ async def tg_command_polling():
             else: await asyncio.sleep(2)
         except Exception: await asyncio.sleep(5)
 
-# --- ИСПРАВЛЕННЫЙ МЕТОД ОТПРАВКИ СООБЩЕНИЙ В МАКС ---
+# --- ИСПРАВЛЕННЫЙ МЕТОД ОТПРАВКИ СООБЩЕНИЙ В МАКС (СТРОГО НАПРЯМУЮ) ---
 async def send_to_max_wrapper(target_id, text, dl_path=None):
     success = False
     
-    # 1. Отправка медиафайла (если есть)
+    # 1. Отправка медиафайла
     if dl_path:
         for method_name in ["send_media", "send_file", "send_document", "send_photo"]:
             if hasattr(client, method_name):
@@ -615,7 +616,7 @@ async def send_to_max_wrapper(target_id, text, dl_path=None):
                         break
                     except Exception: pass
 
-    # 2. Отправка текста (с исправленным порядком аргументов: chat_id первый, text второй)
+    # 2. Отправка текста (chat_id=target_id, text=text)
     if text and (success or not dl_path):
         try:
             if hasattr(client, "send_message"):
