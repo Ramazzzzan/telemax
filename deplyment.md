@@ -1,31 +1,28 @@
-Here is a complete step-by-step Deployment Guide (DEPLOYMENT.md) for setting up Telemax on a new Linux server.
 Telemax Deployment Guide
 This guide covers installing, configuring, and deploying the Telemax MAX-to-Telegram Bridge on a clean Linux system.
+
+
 1. Prerequisites
 Before starting, ensure your system meets the following requirements:
 OS: Linux (Ubuntu 20.04+, Debian 11+, or similar)
 Python: Python 3.10 or newer
 System Utilities: curl, sqlite3, systemd
 
-
 Proxy Server: A running SOCKS5 proxy on 127.0.0.1:10808 (required for Telegram Bot API traffic).
 Traffic Routing Rule:
 Telegram API: Routed through SOCKS5 proxy (socks5h://127.0.0.1:10808).
 MAX Messenger API: Connected directly (no proxy).
+
+
 2. Directory Structure & constants.json
 Create the project directory structure under /home/htpc/telemax:
-
-
 
 Bash
 mkdir -p /home/htpc/telemax/media_queue
 mkdir -p /home/htpc/telemax/dumps
 cd /home/htpc/telemax
 
-
 Directory Layout
-
-
 
 Plaintext
 /home/htpc/telemax/
@@ -37,11 +34,8 @@ Plaintext
 ├── dumps/                  # Raw JSON event dumps
 └── venv/                   # Isolated Python environment
 
-
 Structure of constants.json
 Create /home/htpc/telemax/constants.json with your credentials:
-
-
 
 JSON
 {
@@ -52,17 +46,16 @@ JSON
   "MY_MAX_ID": 119079316
 }
 
-
 Field Descriptions:
 MAX_PHONE: The phone number associated with your MAX Messenger account (formatted with country code).
 TG_BOT_TOKEN: Telegram Bot Token created via @BotFather.
 TG_CHAT_ID: Telegram Forum Supergroup Chat ID where topics will be generated.
 NTFY_URL (Optional): NTFY push notification endpoint URL for critical alerts. Set to "" or null if unused.
 MY_MAX_ID (Optional): Your personal MAX User ID to prevent the bot from forwarding your own outgoing messages.
+
+
 3. Python Virtual Environment Setup
 Set up an isolated virtual environment and install dependencies using the SOCKS5 proxy:
-
-
 
 Bash
 cd /home/htpc/telemax
@@ -86,28 +79,22 @@ pip install --proxy socks5://127.0.0.1:10808 maxapi-python requests
 4. First-Time Authentication
 Run the script manually once to complete SMS and 2FA authentication for MAX Messenger:
 
-
-
 Bash
 /home/htpc/telemax/venv/bin/python /home/htpc/telemax/telemax.py
-
 
 Enter the SMS code sent to your phone when prompted.
 Enter your 2FA password (if enabled on your account).
 Once you see log lines indicating session saved and Запуск MAX-TG Bridge..., press Ctrl + C to stop the script.
+
+
 5. Systemd Service Setup
 Create a systemd unit file to manage Telemax as a background service with auto-restart and watchdog monitoring[cite: 2].
 Create /etc/systemd/system/telemax.service:
 
-
-
 Bash
 sudo nano /etc/systemd/system/telemax.service
 
-
 Paste the following configuration:
-
-
 
 Ini, TOML
 [Unit]
@@ -128,10 +115,7 @@ WatchdogSec=30
 [Install]
 WantedBy=multi-user.target
 
-
 Enable and Start Service
-
-
 
 Bash
 # Reload systemd configuration
@@ -147,15 +131,10 @@ sudo systemctl start telemax.service
 6. Service Management & Troubleshooting
 View Service Status
 
-
-
 Bash
 sudo systemctl status telemax.service
 
-
 View Live Logs
-
-
 
 Bash
 # Systemd journal output
@@ -163,7 +142,6 @@ journalctl -u telemax.service -f -n 50
 
 # Application log file
 tail -f /home/htpc/telemax/telemax.log
-
 
 Telegram Bot Commands
 Once running, send these commands inside your Telegram Forum Group[cite: 2]:
