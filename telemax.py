@@ -190,7 +190,7 @@ async def create_telegram_topic(chat_id, name):
     if ok is True and isinstance(data, dict): return data.get("result", {}).get("message_thread_id")
     return None
 
-async def set_telegram_reaction(chat_id, message_id, emoji="👍"):
+async def set_telegram_reaction(chat_id, message_id, emoji="⚡"):
     return await tg_api_call("setMessageReaction", params={"chat_id": chat_id, "message_id": message_id, "reaction": json.dumps([{"type": "emoji", "emoji": emoji}])}, timeout=10)
 
 async def send_telegram_media(chat_id, thread_id, text, file_info):
@@ -660,7 +660,7 @@ async def handle_tg_reply_to_max(msg):
                 try:
                     success = await send_to_max_wrapper(target_id, text, dl_path)
                     if success and message_id:
-                        await set_telegram_reaction(TG_CHAT_ID, message_id, "✅")
+                        await set_telegram_reaction(TG_CHAT_ID, message_id, "⚡")
                 except Exception as e:
                     logger.error(f"Error sending reply to MAX: {e}")
                     await send_telegram_message(TG_CHAT_ID, thread_id, f"❌ <b>Ошибка отправки:</b> <code>{e}</code>")
