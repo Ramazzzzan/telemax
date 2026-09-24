@@ -1,82 +1,232 @@
-# Telemax 3.5.0 — clean installation
+# Telemax 3.5.2 — установка и обновление
 
-This release contains exactly three files: `telemax.py`, `telemax_test.py`, and this guide.
-Use them together. The application creates **new state only** with `--init`; normal startup
-resumes an existing **3.5.0** database. It never imports, resets, or overwrites a database
-from another release.
+Комплект: `telemax.py`, `telemax_test.py`, этот `deployment.md`. Python 3.10+,
+Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запуске не устанавливаются.
+Версия приложения **3.5.2**, формат БД **351** — разные номера: формат не меняется
+просто из-за нового номера релиза.
 
-The examples use Linux/systemd, user **`htpc`**, and a new directory
-**`/home/htpc/telemax-3.5.0`**. Keep an existing installation elsewhere; do not copy its
-database, queued files, or session into this directory. Run Python and pip as `htpc`,
-not root. If using another account or path, change the commands and service unit together.
+## Обновление работающей установки: БД не удалять
 
-## 1. Requirements and Telegram setup
+Эта инструкция **заменяет прежний совет создать пустую БД и перенести только
+`tm_routes`**. Сохраняются задачи и их ID, результаты отправок, смещения Telegram,
+привязки существующих топиков, mute-политики, старые алиасы, файлы и сессия MAX.
 
-Use Python **3.10 or newer**, `curl`, CA certificates, and **`maxapi-python==2.4.1`**.
-The runtime rejects a different SDK version; it does not install or upgrade dependencies.
-The tests use the Python standard library and loopback HTTP. SDK-specific checks also
-run when the package is installed.
+Поддерживаются:
 
-On Debian/Ubuntu, install the operating-system tools and verify Python:
+- Однофайловая **3.0.0** с `tm_meta.schema=3` и таблицами `tm_jobs`/`tm_routes`.
+- **3.5.0 и 3.5.1** с `tm_meta.schema=350`.
+- Уже обновлённый формат `351`: повторная команда ничего не переносит заново.
 
-```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv curl ca-certificates sqlite3
-python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
-```
+Другая ранее выданная реализация 3.0 с таблицей `bridge_jobs`, а также исходная
+версия только с `queue_v2`, **не поддерживаются этой командой**. Она откажется
+менять такие БД. Не исправляйте номер schema вручную.
 
-Prepare a Telegram bot and a **forum supergroup** with topics enabled. Give the bot
-administrator permissions to manage topics and send messages/media. Obtain the negative
-supergroup ID and your positive **Telegram user ID**. They are different from your MAX
-ID and from each other. Administrators receive ordinary group messages; Telemax applies
-its own sender allowlists. Anyone who can read the Telegram group can read the forwarded
-conversations—the allowlists restrict actions, not visibility. [Telegram FAQ][tg-faq]
+`--upgrade-db` — встроенная офлайн-команда приложения, **не отдельный скрипт**.
+Она проверяет структуру и привязку к Telegram, создаёт проверенную SQLite-копию
+в `backups/pre-3.5.2-<время>-<суффикс>/`, затем одной транзакцией добавляет
+`tm_seen`, индекс срока хранения и поле `tm_jobs.retry_since`. Старые задачи,
+маршруты и смещение не переписываются. Архивные `queue_v2`, `queue_dead_letter`
+и другие старые таблицы остаются на месте, **но никогда не импортируются снова**.
 
-A new bot and group avoid old pending updates and topic bindings. Reusing a bot requires
-stopping every other poller and ensuring it has no active webhook. Telemax neither deletes
-a webhook nor discards pending updates automatically. [Telegram updates][tg-updates]
+Для старого schema 3 нужен `--confirm-legacy-bot`: раньше ID бота не сохранялся
+в БД. Этот флаг означает, что вы проверили: в конфигурации **тот же бот**, для
+которого было сохранено смещение Telegram. Для schema 350/351 флаг не ослабляет
+проверку записанного ID. `TG_CHAT_ID` и аккаунт MAX также нельзя подменять.
 
-Telegram traffic requires a working SOCKS5 proxy, default
-`socks5h://127.0.0.1:10808`. MAX connections, MAX downloads, and optional ntfy notifications
-bypass application-level proxies. Host VPN/routing rules still apply. This release does
-not install or configure the proxy itself.
+### Порядок действий
 
-## 2. Place the release and install the SDK
-
-As `htpc`:
+Распакуйте ZIP в `/home/htpc/telemax/update_3.5.2`, **не поверх работающих файлов**.
+Все команды Python, тесты и операции с рабочими файлами выполняйте от `htpc`.
+Используйте Bash. Если каталог или имя сервиса другие, замените их согласованно.
 
 ```bash
+set -euo pipefail
+cd /home/htpc/telemax
+RELEASE="$PWD/update_3.5.2"
+SERVICE=telemax.service
+
+# Проверки нового кода до остановки старого сервиса. Нет входа в MAX/Telegram.
+./venv/bin/python "$RELEASE/telemax.py" --version
+./venv/bin/python "$RELEASE/telemax.py" --config "$PWD/constants.json" --check-config
+(cd "$RELEASE" && ../venv/bin/python -m unittest -v telemax_test)
+command -v sqlite3 >/dev/null
+
+sudo systemctl stop "$SERVICE"
+# Остановите и вручную запущенные экземпляры. Они используют тот же bot token.
+
 umask 077
-mkdir -p /home/htpc/telemax-3.5.0
-cd /home/htpc/telemax-3.5.0
+SNAP="$PWD/backups/manual-pre-3.5.2-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -m 700 -p "$SNAP"
+sqlite3 telegram_queue.db ".backup '$SNAP/telegram_queue.db'"
+test "$(sqlite3 "$SNAP/telegram_queue.db" 'PRAGMA quick_check;')" = ok
+items=(telemax.py constants.json session_cache media_queue)
+if test -d inbox; then items+=(inbox); fi
+if test -d dumps; then items+=(dumps); fi
+tar -czf "$SNAP/runtime-files.tar.gz" -- "${items[@]}"
+./venv/bin/python -m pip freeze > "$SNAP/requirements.installed.txt"
+sudo systemctl cat "$SERVICE" > "$SNAP/systemd-unit.txt"
+printf 'Полный снимок: %s\n' "$SNAP"
+
+# Подтверждение флагом допустимо только при сохранении того же бота.
+./venv/bin/python "$RELEASE/telemax.py" --config "$PWD/constants.json" \
+    --upgrade-db --confirm-legacy-bot
+
+cp "$RELEASE/telemax.py" "$RELEASE/telemax_test.py" "$RELEASE/deployment.md" .
+./venv/bin/python telemax.py --check
+
+sudo systemctl start "$SERVICE"
+sudo systemctl status "$SERVICE" --no-pager
+sudo journalctl -u "$SERVICE" -n 80 --no-pager
 ```
 
-Place `telemax.py`, `telemax_test.py`, and `deployment.md` from this release directly in
-that directory. Do not substitute files from another archive or the earlier running
-installation.
+Если шаг не прошёл, **не запускайте новый сервис вопреки ошибке**. Не выполняйте
+`--init`, не удаляйте `-wal`/`-shm` и не переносите вручную только топики. Новая
+версия продолжает использовать тот же `session_cache`; действующая сессия не
+требует нового SMS-входа. Отозванная сервером сессия — отдельный случай.
+
+Необязательные новые настройки имеют значения по умолчанию. Для перехода не нужно
+переписывать действующий `constants.json` или обновлять рабочий venv.
+`--check-config` выявит ошибочные/лишние ключи до остановки сервиса.
+
+### После запуска
+
+Проверьте `/status`, текст в обе стороны, файл и сообщение со ссылкой. Убедитесь,
+что сообщения приходят в существующие темы, а `/mute`, `/unmute` и `/chat` работают.
+Существующие `dead`/`uncertain` задачи не воспроизводятся автоматически.
+Для старого `Unsupported MAX attachment type: CONTROL` или SHARE/CONTACT/POLL/CALL
+можно после проверки выполнить `/retry_dlq 70` с фактическим ID задачи.
+Неизвестные поля, которые старая версия уже не сохранила, восстановить невозможно.
+
+При остановке во время внешней отправки задача может стать `uncertain`. Это не
+доказательство недоставки: проверьте получателя до `/retry_dlq ID force`.
+
+### Возврат на старую версию
+
+Нельзя просто запустить старый код с форматом 351. Пока новая версия ещё **не
+начала** принимать и отправлять новые сообщения, можно остановить сервис и
+восстановить согласованный снимок кода, конфигурации, БД, медиа и сессии.
+После работы новой версии восстановление старого снимка может повторить уже
+доставленные сообщения и потерять новые локальные задачи. Сначала сверяйте
+доставки и сохраняйте текущий снимок; автоматического безопасного «отката времени»
+здесь нет. Не удаляйте backup после одного успешного запуска.
+
+## Что изменилось в 3.5.2
+
+### Текст и небинарные вложения
+
+SHARE отображается как URL, заголовок и описание; его превью не скачивается сервером
+Telemax. CONTROL отображается как событие, CONTACT — как контактные поля,
+POLL — как текстовый снимок вопроса/вариантов, CALL — как доступные метаданные звонка.
+Интерактивные опросы и звонки между сервисами не синхронизируются.
+
+Неизвестный тип заменяется явным текстовым маркером, а исходный объект сохраняется.
+При возможности дополнительный JSON неизвестного типа записывается в
+`dumps/errors/job-<ID>.json`. Ошибка записи диагностического файла не блокирует текст.
+
+**Текст MAX всегда отправляется отдельной задачей от бинарных вложений.** Поэтому
+ошибка файла не забирает с собой текст. Фото/видео могут по-прежнему группироваться
+в альбом; при сбое такого альбома его файлы остаются для разбирательства в DLQ.
+Старые смешанные задачи преобразуются при обработке/явном повторе, не задним числом
+после подтверждённой доставки.
+
+### Приём MAX: сначала inbox, затем SQLite
+
+Callback сначала атомарно записывает JSON в `inbox/*.json`: запись файла, `fsync`,
+переименование и `fsync` каталога. Отдельный обработчик переносит событие в SQLite,
+а исходный файл удаляется **только после commit или подтверждения дубликата**.
+Полная очередь или временная ошибка SQLite не требуют рестарта MAX-клиента.
+Повторный импорт после аварии между commit и удалением файла дедуплицируется.
+
+В `inbox/quarantine` сохраняются повреждённые/чужие конверты; их нужно разбирать
+вручную. Они не удаляются и продолжают занимать квоту. Полные `.part`, оставшиеся
+после аварии до переименования, восстанавливаются при первом обращении к inbox.
+
+**Граница гарантий:** если недоступна и SQLite, и файловая запись, либо исчерпана
+квота inbox/свободный диск, callback удерживает ещё не сохранённое событие в памяти
+и повторяет запись, а журнал и ntfy сообщают об аварийном состоянии. Оно станет
+устойчивым к перезапуску только после успешного `fsync`. Сбой/выключение процесса
+до этого может потерять событие. При длительной остановке записи SDK также может
+накапливать ожидающие callbacks в памяти; это не бесконечный буфер. Исправляйте
+диск и права, а не запускайте циклический restart. События, не полученные процессом
+вообще, мост не восстанавливает; на replay MAX нельзя полагаться.
+
+### Параллельность и задержанные задачи
+
+По умолчанию четыре обработчика для подготовки MAX и для каждого направления
+отправки, три параллельных скачивания. Квота диска учитывает зарезервированное место
+для активных скачиваний. Одновременно не выполняются две задачи одного вида для
+одного маршрута. Один долгий запрос не держит общий HTTP-lock до своего завершения.
+
+Ограничение **3,1 секунды между началами Telegram-запросов сохранено**: топики
+находятся в одной supergroup и не дают независимых групповых лимитов. Ответ `429`
+с `retry_after` останавливает новые запросы. Удаление ограничения не является
+исправлением производительности. Важное изменение: долгий upload уже не держит
+этот lock и не блокирует отправку в другую тему на всю длительность upload.
+
+Ожидающая повторной попытки задача с будущим `next_at` больше не блокирует более
+новые готовые задачи того же маршрута. **При сбоях порядок сообщений может измениться.**
+Все повторные попытки, включая `count=False`, ограничены `RETRY_WINDOW_SECONDS`
+от первой ошибки. По истечении задача становится `dead`, а не удаляется. `uncertain`
+не повторяется автоматически. Явный `/retry_dlq` запускает новое окно повторов.
+Если все рабочие слоты заняты тяжёлыми задачами, новые задачи всё ещё ждут слот;
+параллельность ограничена, а не неограниченна.
+
+### Хранение, дедупликация и освобождение места
+
+Обслуживание раз в минуту удаляет завершённые/отменённые задачи старше `HISTORY_DAYS`
+либо сверх `HISTORY_MAX_JOBS`. Очистка пакетная; это не жёсткая мгновенная квота
+всего `.db`. Исходники/предки активных задач, `pending`, `running`, `dead` и `uncertain`
+**не удаляются по сроку хранения**. Необработанная DLQ и сохраняемые архивные таблицы
+требуют контроля оператором. Квота `QUEUE_LIMIT` ограничивает допуск новых входящих
+рабочих задач; раскрытие события в несколько частей и служебные команды могут
+временно увеличить число записей сверх неё. DLQ сама по себе допуск не блокирует.
+
+Для удалённых задач сохраняются компактные ключи `tm_seen`, а не тела сообщений.
+Они живут до `DEDUP_DAYS` после завершения, но ограничены `DEDUP_MAX_KEYS`: при
+переполнении удаляются наиболее старые. **Дедупликация имеет ограниченное окно**;
+очень старый повтор за его пределами может пройти повторно. Активная задача всегда
+сохраняет собственный уникальный ключ.
+
+Новые БД создаются с incremental auto-vacuum. Обслуживание выполняет checkpoint
+WAL и освобождает свободные страницы небольшими порциями. Старые БД могут повторно
+использовать свободные страницы, но не сразу уменьшать размер файла. Для физического
+сжатия и включения incremental auto-vacuum у обновлённой старой БД:
 
 ```bash
-set -e
-cd /home/htpc/telemax-3.5.0
-python3 -m venv venv
-./venv/bin/python -m pip install 'maxapi-python==2.4.1'
-./venv/bin/python -m pip check
-./venv/bin/python -m pip freeze > requirements.installed.txt
-./venv/bin/python telemax.py --version
+set -euo pipefail
+cd /home/htpc/telemax
+sudo systemctl stop telemax.service
+./venv/bin/python telemax.py --compact-db
+./venv/bin/python telemax.py --check
+sudo systemctl start telemax.service
 ```
 
-The version command must print **`Telemax 3.5.0`**. The SDK is pinned; its transitive
-packages are resolved during installation, not locked by these three files. The generated
-`requirements.installed.txt` records that environment. Do not blindly update it afterward.
-If this host cannot reach PyPI, provision compatible wheels through your own package
-mirror or offline wheelhouse before proceeding; the Telegram proxy setting does not
-configure pip.
+`--compact-db` сначала создаёт новую проверенную копию, проверяет запас диска,
+затем выполняет VACUUM. Команда **не удаляет задачи** и не очищает DLQ. Для проверки
+запаса используется консервативное требование: три размера текущей БД плюс
+`MIN_FREE_MB`; реальные условия диска/большой WAL всё равно контролируйте. Если
+команда не прошла — решите ошибку до следующего шага. Бэкапы автоматически не удаляются.
 
-## 3. Create constants.json
+### Защита URL
 
-Create `constants.json` in the same directory. Replace the example phone, bot token,
-group ID, and the two user-ID entries. Keep `MY_MAX_ID` as `null` to resolve the account
-ID during login.
+Перед каждым прямым HTTPS-скачиванием и переходом редиректа проверяется адрес DNS
+и фиксируется выбранный IP. Запрещены непубличные/специальные адреса, стандартные
+NAT64 `64:ff9b::/96`, `64:ff9b:1::/48`, IPv4-mapped/translated, 6to4 и Teredo.
+
+Прямое скачивание MAX по умолчанию **только IPv4** (`MEDIA_IPV4_ONLY=true`), чтобы не
+пропускать неизвестный локальный network-specific NAT64-префикс. На IPv6-only
+сервере это требует осознанной настройки: при разрешении IPv6 внесите все локальные
+translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте выход во внутренние сети
+на уровне firewall. Произвольный префикс NAT64 невозможно определить по одному
+`is_global`. Прокси, настроенный администратором для Telegram, — отдельная доверенная
+граница; эти проверки относятся к URL вложений MAX.
+
+## Полная конфигурация
+
+Старые корректные ключи однофайловой 3.0/3.5.x сохраняются. Все дополнительные ключи
+ниже имеют показанные значения по умолчанию; добавлять их необязательно. Поменяйте
+примерные телефон/токен/ID перед использованием. Для обновления сохраните существующие
+идентификаторы, а не подставляйте значения из примера.
 
 ```json
 {
@@ -94,226 +244,175 @@ ID during login.
   "MIN_FREE_MB": 256,
   "QUEUE_LIMIT": 50000,
   "HISTORY_DAYS": 30,
-  "MAX_ATTEMPTS": 10
+  "MAX_ATTEMPTS": 10,
+  "ERROR_DUMP_LIMIT_MB": 256,
+  "INBOX_LIMIT_MB": 512,
+  "WORKERS": 4,
+  "DOWNLOAD_WORKERS": 3,
+  "RETRY_WINDOW_SECONDS": 86400,
+  "HISTORY_MAX_JOBS": 10000,
+  "DEDUP_DAYS": 90,
+  "DEDUP_MAX_KEYS": 200000,
+  "MEDIA_IPV4_ONLY": true,
+  "BLOCKED_IPV6_PREFIXES": []
 }
 ```
 
-These are **all** the supported configuration keys. Unknown or duplicate keys are
-rejected instead of silently ignored. Only the phone, token, and group ID are mandatory
-for configuration validation; the other keys use the following defaults when omitted.
-For two-way operation, configure the authorization lists explicitly.
+Размеры `_MB` измеряются в MiB. Счётчики и сроки — положительные целые.
+`WORKERS` и `DOWNLOAD_WORKERS`: от 1 до 16. `TG_DOWNLOAD_MB` ограничен 20 MiB и не
+снимает ограничение Telegram cloud getFile. `MAX_ATTEMPTS` — число учитываемых
+попыток, дополненное общим окном `RETRY_WINDOW_SECONDS`. `INBOX_LIMIT_MB` — квота
+неимпортированных JSON, отдельно от медиа и диагностических дампов. Это всё равно
+могут быть одни физические диск/файловая система.
 
-| Key | Default / meaning |
-| --- | --- |
-| `MAX_PHONE` | Required; phone number with country code. |
-| `TG_BOT_TOKEN` | Required; token for this bot. |
-| `TG_CHAT_ID` | Required; negative forum supergroup ID. The database is bound to this group and bot ID. |
-| `MY_MAX_ID` | `null`; resolved from the authenticated MAX profile. A supplied ID must match that profile. |
-| `TG_ALLOWED_USER_IDS` | `[]`; users allowed to reply through MAX and use read-only commands. |
-| `TG_ADMIN_USER_IDS` | `[]`; users allowed to manage routes, aliases and DLQ. Admins can also reply. This list does **not** inherit the allowed-user list. |
-| `TG_PROXY` | `socks5h://127.0.0.1:10808`; explicit SOCKS5 proxy with remote DNS. No direct Telegram fallback. |
-| `NTFY_URL` | Empty string; notifications disabled. Set an HTTP(S) endpoint to receive DLQ/crash alerts. |
-| `MAX_MEDIA_MB` | `49`; maximum downloaded MAX file size and maximum reused local MAX attachment size. |
-| `TG_DOWNLOAD_MB` | `20`; Telegram download size budget. Values above 20 are capped at 20. Server-side limits still apply. |
-| `MEDIA_DISK_LIMIT_MB` | `2048`; budget for files directly inside `media_queue`, including retained temporary files. |
-| `MIN_FREE_MB` | `256`; free-space reserve for media downloads. |
-| `QUEUE_LIMIT` | `50000`; admission limit for new message events. Internal expansion and administrative jobs may temporarily exceed it; it is not a total database quota. |
-| `HISTORY_DAYS` | `30`; after this age, completed/cancelled job bodies are cleared. Small deduplication records remain. Active and failed jobs are retained. |
-| `MAX_ATTEMPTS` | `10`; counted failures before holding a job as `dead`. Rate limits and configured no-count waits do not exhaust this budget. |
+`TG_ALLOWED_USER_IDS` разрешает отправку через ваш MAX-аккаунт. `TG_ADMIN_USER_IDS`
+разрешает также управляющие команды; список администраторов не наследуется неявно.
+Пустые списки отключают действия Telegram → MAX, но не MAX → Telegram. Все участники
+группы, имеющие доступ к сообщениям, могут читать пересылаемую переписку.
 
-Size settings use **MiB** (`1024²` bytes); size/count settings must be positive integers.
-Neither configuration nor a new SDK can override Telegram's cloud API limits.
-[Telegram file downloads][tg-files]
+Неизвестные и повторяющиеся ключи конфигурации отклоняются. `MEDIA_LIMIT_MB`,
+`RETENTION_DAYS` и другие ключи из альтернативного старого комплекта не являются
+синонимами. `NTFY_URL` необязателен, пустая строка отключает уведомления.
 
-When both user lists are empty, MAX → Telegram still works; Telegram → MAX and commands
-are disabled. Bots, anonymous `sender_chat` messages, and automatic forwards are denied.
-Unauthorized updates are ignored, not retained for later replay.
+## Чистая установка — только если установки действительно ещё нет
+
+Не используйте этот раздел вместо обновления существующей БД.
+Пример нового каталога: `/home/htpc/telemax-3.5.2`, пользователь `htpc`.
+
+1. Нужны Python 3.10+, venv, `curl`, CA certificates, а для приведённых команд —
+   `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:10808`
+   либо адрес из `TG_PROXY`. Установка Telemax не устанавливает сам прокси.
+2. Создайте каталог, положите три файла релиза и `constants.json` по примеру выше.
+3. Подготовьте окружение и пустую БД:
 
 ```bash
-cd /home/htpc/telemax-3.5.0
+set -euo pipefail
+umask 077
+mkdir -p /home/htpc/telemax-3.5.2
+cd /home/htpc/telemax-3.5.2
+python3 -c 'import sys; assert sys.version_info >= (3,10)'
+python3 -m venv venv
+./venv/bin/python -m pip install 'maxapi-python==2.4.1'
+./venv/bin/python -m pip check
+./venv/bin/python -m pip freeze > requirements.installed.txt
 chmod 600 constants.json
 ./venv/bin/python telemax.py --check-config
 ./venv/bin/python -m unittest -v telemax_test
-```
-
-`--check-config` checks configuration, the SDK version/imports, and availability of
-`curl`. It does not open the database or call the services. Tests do not use your account
-or real credentials. Run the tests in this venv so the SDK checks are not skipped; a
-passing suite is not proof of live delivery.
-
-## 4. Initialize new state and authenticate MAX
-
-Before the first network run, stop any older Telemax instance using this bot/account.
-If the existing service is named `telemax.service`:
-
-```bash
-if systemctl cat telemax.service >/dev/null 2>&1; then
-  sudo systemctl stop telemax.service
-fi
-```
-
-Also stop manually launched copies. A directory lock prevents two copies in the same
-state directory, but cannot stop a different installation from using the same bot.
-
-Run as `htpc`:
-
-```bash
-set -e
-cd /home/htpc/telemax-3.5.0
 ./venv/bin/python telemax.py --init
 ./venv/bin/python telemax.py --check
 ./venv/bin/python telemax.py
 ```
 
-`--init` is an offline, one-time initializer. It fails if the database or SQLite sidecar
-files already exist. There is no force/reset option. After initialization, use normal
-startup—not another `--init`. `--check` validates existing state read-only and does not
-recover or resend interrupted jobs.
+Если сервер не может получить пакет из PyPI, заранее подготовьте совместимое
+окружение/коллекцию wheels через свой доступный источник. `TG_PROXY` не настраивает
+pip. Три файла фиксируют версию SDK, но не полный lock его транзитивных зависимостей;
+`requirements.installed.txt` записывает реально установленный набор.
 
-During the first interactive run, complete the MAX SMS/2FA prompts. After the log reports
-**`MAX session ready`**, stop with **Ctrl+C** before starting the systemd service. The
-session is saved in `session_cache`. Reauthentication, when required, is also interactive;
-do not expect systemd to answer SMS/2FA prompts.
+При первом интерактивном запуске завершите авторизацию MAX, проверьте журнал и
+`/status`, затем остановите процесс Ctrl+C. Это действие для **пустой установки**;
+обновление сохраняет сессию. `--init` не перезаписывает существующий файл БД.
 
-The resulting layout is:
+Telegram: используйте forum supergroup; бот должен уметь управлять топиками и
+отправлять сообщения/медиа. Нельзя одновременно использовать другой poller с тем
+же токеном. Если настроен webhook, уберите его самостоятельно, не отбрасывая pending
+updates. Приложение не выполняет такие внешние изменения автоматически.
 
-```text
-/home/htpc/telemax-3.5.0/
-├── telemax.py
-├── telemax_test.py
-├── deployment.md
-├── constants.json
-├── requirements.installed.txt
-├── telegram_queue.db       # State marker 350; tm_meta, tm_routes, tm_jobs
-├── telegram_queue.db-wal   # SQLite may create/remove these sidecars
-├── telegram_queue.db-shm
-├── .telemax.lock
-├── session_cache/
-├── media_queue/
-├── telemax.log
-└── venv/
-```
+### Systemd для чистой установки
 
-## 5. Install the systemd service
-
-Create `/etc/systemd/system/telemax.service`:
+`/etc/systemd/system/telemax.service`:
 
 ```ini
 [Unit]
-Description=Telemax 3.5.0 MAX-Telegram bridge
+Description=Telemax MAX-Telegram bridge
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=notify
-NotifyAccess=main
 User=htpc
 Group=htpc
-WorkingDirectory=/home/htpc/telemax-3.5.0
-ExecStartPre=/home/htpc/telemax-3.5.0/venv/bin/python /home/htpc/telemax-3.5.0/telemax.py --check
-ExecStart=/home/htpc/telemax-3.5.0/venv/bin/python /home/htpc/telemax-3.5.0/telemax.py
+WorkingDirectory=/home/htpc/telemax-3.5.2
+ExecStart=/home/htpc/telemax-3.5.2/venv/bin/python /home/htpc/telemax-3.5.2/telemax.py
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=120
-TimeoutStopSec=45
 WatchdogSec=30
+TimeoutStopSec=90
 UMask=0077
-NoNewPrivileges=yes
-PrivateTmp=yes
-Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Для существующей установки оставьте её фактические `WorkingDirectory`/`ExecStart`
+и рабочий venv, не заменяйте их путём из clean-install-примера.
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now telemax.service
-sudo systemctl status telemax.service --no-pager
-sudo journalctl -u telemax.service -n 50 --no-pager
+sudo journalctl -u telemax.service -n 80 --no-pager
 ```
 
-Systemd readiness means the initial MAX login completed. The watchdog monitors the
-running process; neither signal proves that both message directions are delivering.
-Inspect `/status` and perform the checks below. [Systemd service semantics][systemd]
+## Команды Telegram
 
-## 6. Smoke test and commands
-
-Send a new MAX message to the account from another user. Confirm that a Telegram topic
-appears and contains it. Reply in that topic from an allowed Telegram user; confirm the
-MAX recipient sees it and that Telegram receives the lightning reaction. Test a photo,
-a document, a voice message, and a long text in both directions. An unauthorized group
-member must not be able to send through the MAX account or modify the DLQ.
-
-For commands, use the configured Telegram group:
-
-| Command | Access and effect |
+| Команда | Действие |
 | --- | --- |
-| `/help` | Allowed users/admins; command reference. |
-| `/status` | Allowed users/admins; timestamps, queue states, and last observed MAX health. |
-| `/dlq` | Allowed users/admins; first 20 `dead`/`uncertain` jobs and their errors. |
-| `/retry_dlq` | Admins; retry all `dead` jobs, but not `uncertain` sends. |
-| `/retry_dlq ID` | Admins; retry one `dead` job. |
-| `/retry_dlq ID force` | Admins; also retry an `uncertain` job. **May duplicate a delivery.** |
-| `/clear_dlq confirm` | Admins; cancel all `dead`/`uncertain` jobs. No undo or immediate deletion of every file. |
-| `/alias Name` | Admins, inside a bound topic; save its display name and queue a Telegram topic rename. Does not rename MAX contacts. |
-| `/bind MAX_CHAT_ID` | Admins, inside a topic; explicitly bind a MAX **chat ID**, not a user ID. |
+| `/status` | Версия, соединение, доставка, очередь, состояние inbox. |
+| `/dlq` | Ошибки с временем сообщения, адресатом и путём JSON при его наличии. |
+| `/retry_dlq ID` | Повтор конкретной `dead` задачи; текст небинарных вложений больше не блокируется. |
+| `/retry_dlq` | Повтор всех `dead`, но не `uncertain`. Не используйте вслепую для массовой очереди. |
+| `/retry_dlq ID force` | Осознанный повтор `uncertain`, возможен дубль. |
+| `/clear_dlq confirm` | Отмена задач DLQ; это намеренный отказ от доставки. |
+| `/alias Имя` | Изменение имени привязанного топика. |
+| `/bind MAX_CHAT_ID` | Привязка текущего топика к ID чата, не пользователя MAX. |
+| `/chat MAX_USER_ID Имя` или `/chat +79991234567 Имя` | Новый/существующий личный маршрут; без автоматического приветствия. |
+| `/mute` / `/unmute` | Внутри топика — выключить/включить MAX → Telegram. |
+| `/mute TOPIC_ID` / `/unmute TOPIC_ID` | То же из General, с Telegram topic ID. |
+| `/muted` | Список выключенных направлений. |
 
-An outgoing message with an unknown result after a timeout or interrupted send is held
-as `uncertain`. Check the destination before forcing a retry. A failed topic creation
-with unknown result likewise needs manual inspection and `/bind`; it is not repeated
-blindly. A confirmed deleted topic is recreated for the same MAX route, never silently
-replaced by posting into the general topic. A clean database knows none of your earlier
-topic bindings; new topics are created as messages arrive, or can be bound explicitly.
+Команды изменения маршрутов/состояния требуют admin-списка. Mute не отключает
+ответы Telegram → MAX, не отменяет уже начатый внешний запрос и не воспроизводит
+накопленные за время mute сообщения после unmute. Политика хранится в `tm_meta`.
+Поиск MAX по телефону зависит от того, доступен ли соответствующий пользователь
+этому аккаунту; `/chat` не обходит приватность сервиса.
 
-Telegram rate limits are delayed using `retry_after`. Mutation requests are paced at a
-fixed minimum interval of 3.1 seconds; there is no configuration key to change this.
-[Telegram API][tg-api]
+## Эксплуатация и диагностика
 
-## 7. Operation and limits
+`--check-config`: конфигурация + установленный SDK + curl; без сетевых запросов и БД.
+`--check`: дополнительно read-only проверка формата/целостности БД, без изменения
+состояний задач. CLI-команды upgrade/init/compact работают офлайн под блокировкой
+экземпляра; остановка сервиса всё равно обязательна.
 
-```bash
-# Read logs.
-sudo journalctl -u telemax.service -f -n 50
-tail -f /home/htpc/telemax-3.5.0/telemax.log
+`/status` и сообщения об ошибках сами зависят от доступности SQLite и Telegram.
+При отказе хранилища опирайтесь на `journalctl`, свободное место и ntfy, если он
+настроен. Watchdog означает живой процесс, а не гарантированную доставку.
 
-# Validate a configuration edit and apply it.
-cd /home/htpc/telemax-3.5.0
-./venv/bin/python telemax.py --check && sudo systemctl restart telemax.service
-```
+`dumps/errors/job-<ID>.json` содержит исходный SDK message model/Telegram update,
+контекст маршрута и данные задачи. Это не сырой сетевой пакет. Для старых задач
+доступны только ранее сохранённые поля. Полные JSON, inbox, БД, сессия и backups
+содержат личную информацию. Каталоги создаются с `0700`, файлы — с `0600`.
+Не коммитьте их в Git. У активной ошибочной задачи данные не очищаются по возрасту.
+Ошибка квоты дампов не означает, что сообщение удалено из БД.
 
-Configuration is loaded at startup; changing it requires a restart. The group ID and
-bot ID must continue matching this database. Rotating the token for the same Telegram
-bot does not change its ID.
+Логи ротируются: до 5 MiB на файл, три резервных файла. JSON-дампы и медиа имеют
+отдельные бюджеты/очистку. Контролируйте общий свободный диск, число `dead`/
+`uncertain`, размер inbox/quarantine и возраст старейшей задачи. Ни автоочистка,
+ни увеличенная квота не заменяют устранение постоянной ошибки доступа или хранения.
 
-Messages received by Telemax are saved before processing, and Telegram offsets are
-saved with accepted work. MAX events missed while the process is offline still depend
-on SDK/server replay. This is not a full history archiver or an exactly-once bridge.
+## Проверки перед доверием переписке
 
-Text, photos, supported files, voice and video paths are handled. Telegram albums arrive
-as separate updates and are forwarded to MAX as separate messages. Edits, deletions,
-interactive polls, contacts and locations are not synchronized. Unsupported content is
-held for inspection; the bridge does not transcode incompatible audio/video. Telegram
-output uses plain text; PyMax's send path may interpret Markdown in text sent to MAX.
-[PyMax media contracts][pymax-files] · [PyMax formatting][pymax-format]
+Тесты используют временные БД, заглушки API и локальный HTTP-сервер для curl.
+Дополнительные контрактные тесты требуют установленного SDK 2.4.1; без него они
+явно пропускаются. Наличие успешных локальных тестов **не означает** проверку
+живых аккаунтов. Проверьте вручную текст/файл в обе стороны, SHARE/CONTROL,
+повтор старой DLQ, mute и новый личный чат. Не обещается exactly-once доставка.
 
-There are no raw diagnostic dumps. Logs rotate at 5 MiB with three retained backups.
-Queue payloads and session files still contain private data. Completed media becomes
-eligible for cleanup after 24 hours when no active/failed job references it. Cleanup
-runs approximately every minute. Failed/uncertain jobs and their files are not removed
-by age; manage them through the DLQ. Deduplication rows accumulate, so monitor database
-and disk usage separately from the media budget.
+## Первичные источники контрактов
 
-Do not put `constants.json`, databases, `session_cache`, media, logs, or backups in Git.
-Only the three release files belong in the repository. Before any later maintenance,
-stop the service and take a complete private snapshot of this release's code,
-configuration, database **and its sidecars**, session, and media together. Do not restore
-an old queue over a newer one without reviewing which messages have already been sent.
-
-[pymax-files]: https://docs.pymax.org/files.html
-[pymax-format]: https://docs.pymax.org/formatting.html
-[tg-api]: https://core.telegram.org/bots/api
-[tg-files]: https://core.telegram.org/bots/api#getfile
-[tg-faq]: https://core.telegram.org/bots/faq#what-messages-will-my-bot-get
-[tg-updates]: https://core.telegram.org/bots/api#getting-updates
-[systemd]: https://www.freedesktop.org/software/systemd/man/systemd.service.html
+- [PyMax 2.4.1: SHARE](https://github.com/MaxApiTeam/PyMax/blob/v2.4.1/src/pymax/types/domain/attachments/share.py),
+  [CONTACT](https://github.com/MaxApiTeam/PyMax/blob/v2.4.1/src/pymax/types/domain/attachments/contact.py),
+  [POLL](https://github.com/MaxApiTeam/PyMax/blob/v2.4.1/src/pymax/types/domain/attachments/poll.py),
+  [CALL](https://github.com/MaxApiTeam/PyMax/blob/v2.4.1/src/pymax/types/domain/attachments/call.py).
+- [Telegram Bot FAQ: лимиты групп](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this).
+- [SQLite auto-vacuum](https://sqlite.org/pragma.html#pragma_auto_vacuum), [VACUUM](https://sqlite.org/lang_vacuum.html).
+- [RFC 6052: IPv4-embedded IPv6 и network-specific prefixes](https://datatracker.ietf.org/doc/html/rfc6052).
