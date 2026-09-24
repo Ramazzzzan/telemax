@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Telemax: single-file MAX <-> Telegram bridge (Python 3.10+, maxapi-python==2.4.1).
+"""Telemax 3.5.0 — MAX <-> Telegram bridge for a clean installation.
 
-Existing constants.json, session_cache and telegram_queue.db are reused.
-Add TG_ALLOWED_USER_IDS and TG_ADMIN_USER_IDS (lists of numeric Telegram user IDs).
-Empty lists DISABLE Telegram -> MAX / administrative commands, not MAX -> Telegram.
-Stop the old service before replacing this file. First migration makes a SQLite backup.
-Rollback to the old script requires restoring that backup, not just replacing the code.
+Python 3.10+; maxapi-python==2.4.1; curl; Linux.
+Configure constants.json, run --init once, then start normally.
+State from other releases is rejected, never imported or overwritten.
 
 Commands: /status, /dlq, /retry_dlq [ID], /retry_dlq ID force,
           /clear_dlq confirm, /alias Name, /bind MAX_CHAT_ID, /help.
-A timeout AFTER starting a send is NOT proof of failure. Such jobs are 'uncertain'
-and require an explicit '/retry_dlq ID force' (which can duplicate a delivery).
-No exactly-once guarantee is claimed. MAX events not received by this process
-still depend on the SDK/server's replay behaviour; this is not a history archiver.
+An interrupted external send is held as uncertain until an explicit forced retry.
+Exactly-once delivery and replay of MAX events missed while offline are not promised.
 
-Checks: python telemax.py --self-test; python telemax.py --check-config
-API contracts: https://docs.pymax.org/files.html
-               https://core.telegram.org/bots/api
+Checks: python telemax.py --check-config; python telemax.py --check
+Tests:  python -m unittest -v telemax_test
 """
 from __future__ import annotations
 
@@ -28,12 +23,12 @@ import dataclasses
 import enum
 import fcntl
 import hashlib
-import html.parser
 import importlib.metadata
 import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import os
 import random
 import re
@@ -42,14 +37,14 @@ import signal
 import socket
 import sqlite3
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-VERSION = "3.0.0"
+VERSION = "3.5.0"
+SCHEMA_VERSION = "350"
 SDK_VERSION = "2.4.1"
 LOG = logging.getLogger("telemax")
 ACTIVE = ("pending", "running", "dead", "uncertain")
@@ -119,27 +114,6 @@ def split_text(text: str, limit: int = 4000) -> list[str]:
     return result
 
 
-class PlainHTML(html.parser.HTMLParser):
-    """Convert legacy, generated HTML once; new messages use no parse_mode."""
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-
-    def handle_data(self, data):
-        self.parts.append(data)
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "br":
-            self.parts.append("\n")
-
-
-def plain_legacy(text: str) -> str:
-    parser = PlainHTML()
-    parser.feed(text or "")
-    parser.close()
-    return "".join(parser.parts)
-
-
 def safe_name(name: str, fallback: str = "attachment.bin") -> str:
     name = str(name or "").replace("\\", "/").split("/")[-1]
     name = re.sub(r"[^\w.() -]", "_", name, flags=re.UNICODE).strip(" .")
@@ -149,17 +123,6 @@ def safe_name(name: str, fallback: str = "attachment.bin") -> str:
     return name if len(name.encode("utf-8")) <= 150 else (
         name[:30].rstrip(" .") + "_" + hashlib.sha256(name.encode()).hexdigest()[:12] + suffix
     )
-
-
-def media_kind(ext: str) -> str:
-    ext = ext.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
-        return "photo"
-    if ext in {".mp4", ".mov"}:
-        return "video"
-    if ext in {".ogg", ".oga", ".opus"}:
-        return "voice"
-    return "document"
 
 
 def tg_parts(text: str, files: list[dict]) -> list[dict]:
@@ -201,15 +164,33 @@ class Config:
     history_days: int = 30
     max_attempts: int = 10
 
+    KEYS = frozenset({
+        "MAX_PHONE", "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_ALLOWED_USER_IDS",
+        "TG_ADMIN_USER_IDS", "MY_MAX_ID", "TG_PROXY", "NTFY_URL", "MAX_MEDIA_MB",
+        "TG_DOWNLOAD_MB", "MEDIA_DISK_LIMIT_MB", "MIN_FREE_MB", "QUEUE_LIMIT",
+        "HISTORY_DAYS", "MAX_ATTEMPTS",
+    })
+
     @property
     def media(self) -> Path:
         return self.root / "media_queue"
 
     @classmethod
     def load(cls, path: Path) -> Config:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        def unique_keys(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError(f"Duplicate configuration key: {key}")
+                obj[key] = value
+            return obj
+
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_keys)
         if not isinstance(data, dict):
             raise ValueError("constants.json must contain an object")
+        unknown = sorted(set(data) - cls.KEYS)
+        if unknown:
+            raise ValueError("Unknown configuration setting(s): " + ", ".join(unknown))
         for key in ("MAX_PHONE", "TG_BOT_TOKEN", "TG_CHAT_ID"):
             if data.get(key) is None or str(data[key]).strip() in {"", "None", "null"}:
                 raise ValueError(f"Missing required setting: {key}")
@@ -217,7 +198,7 @@ class Config:
         chat_id = number(data["TG_CHAT_ID"])
         if not re.fullmatch(r"\+\d{7,16}", phone):
             raise ValueError("MAX_PHONE must be a phone number with country code")
-        if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
+        if not re.fullmatch(r"[1-9]\d*:[A-Za-z0-9_-]+", token):
             raise ValueError("Invalid TG_BOT_TOKEN format")
         if chat_id is None or chat_id >= 0:
             raise ValueError("TG_CHAT_ID must be a negative Telegram supergroup ID")
@@ -241,11 +222,16 @@ class Config:
         if data.get("MY_MAX_ID") is not None and (own is None or own <= 0):
             raise ValueError("MY_MAX_ID must be a positive integer or null")
         proxy = str(data.get("TG_PROXY", "socks5h://127.0.0.1:10808"))
+        if any(ord(c) < 33 for c in proxy):
+            raise ValueError("TG_PROXY must not contain whitespace/control characters")
         u = urlsplit(proxy)
-        if u.scheme != "socks5h" or not u.hostname or not u.port:
+        if u.scheme != "socks5h" or not u.hostname or not u.port or u.path or u.query or u.fragment:
             raise ValueError("TG_PROXY must be socks5h://host:port; direct Telegram is disabled")
         ntfy = data.get("NTFY_URL") or ""
-        if ntfy and urlsplit(ntfy).scheme not in {"https", "http"}:
+        if not isinstance(ntfy, str) or (ntfy and (
+                any(ord(c) < 33 for c in ntfy)
+                or urlsplit(ntfy).scheme not in {"https", "http"}
+                or not urlsplit(ntfy).hostname)):
             raise ValueError("Invalid NTFY_URL")
         return cls(path.resolve().parent, phone, token, chat_id,
                    ids("TG_ALLOWED_USER_IDS"), ids("TG_ADMIN_USER_IDS"), own, proxy, ntfy,
@@ -291,73 +277,130 @@ def configure_logging(cfg: Config):
 
 class Store:
     """One DB thread. Transactions include all state changes, not individual queries."""
+    TABLES = {
+        "tm_meta": {"key", "value"},
+        "tm_routes": {"max_id", "thread_id", "name", "type", "state"},
+        "tm_jobs": {"id", "key", "kind", "route", "payload", "state", "phase",
+                    "attempts", "next_at", "error", "result", "created", "updated"},
+    }
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.path = cfg.root / "telegram_queue.db"
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="telemax-db")
-        self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False,
-                                    isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = self.open_existing(cfg)
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="telemax-db")
         try:
-            self._initialize()
+            self.validate(self.conn, cfg)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                "UPDATE tm_jobs SET state='uncertain',error='Restart during external send; check delivery',"
+                "updated=? WHERE state='running' AND phase='send'", (time.time(),))
+            self.conn.execute(
+                "UPDATE tm_jobs SET state='pending',phase='',next_at=0 WHERE state='running'")
+            self.conn.execute("UPDATE tm_routes SET state='uncertain' WHERE state='creating'")
+            self.conn.commit()
+            os.chmod(self.path, 0o600)
         except BaseException:
+            self.conn.rollback()
             self.conn.close()
             self.pool.shutdown(wait=True)
             raise
 
-    def _initialize(self):
-        c = self.conn
-        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        schema = None
-        if "tm_meta" in tables:
-            row = c.execute("SELECT value FROM tm_meta WHERE key='schema'").fetchone()
-            schema = row[0] if row else None
-        if schema not in {None, "3"}:
-            raise RuntimeError(f"Unsupported Telemax database schema: {schema}")
-        if schema is None and tables:
-            backup = self.path.with_name(self.path.name + ".pre-v3-" +
-                                        time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ".bak")
-            with sqlite3.connect(backup) as target:
-                c.backup(target)
-            os.chmod(backup, 0o600)
-            LOG.warning("Pre-migration database backup: %s", backup.name)
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA synchronous=FULL")
-        c.execute("PRAGMA busy_timeout=30000")
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS tm_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS tm_routes(
-                max_id TEXT PRIMARY KEY,thread_id INTEGER UNIQUE,name TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'group',state TEXT NOT NULL DEFAULT 'new');
-            CREATE TABLE IF NOT EXISTS tm_aliases(max_id TEXT PRIMARY KEY,alias TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS tm_jobs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL,route TEXT NOT NULL,payload TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'pending',phase TEXT NOT NULL DEFAULT '',
-                attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,
-                error TEXT NOT NULL DEFAULT '',result TEXT NOT NULL DEFAULT '{}',
-                created REAL NOT NULL,updated REAL NOT NULL);
-            CREATE INDEX IF NOT EXISTS tm_job_due ON tm_jobs(kind,state,next_at,id);
-            CREATE INDEX IF NOT EXISTS tm_job_route ON tm_jobs(kind,route,state,id);
-        """)
-        c.execute("BEGIN IMMEDIATE")
+    @staticmethod
+    def open_existing(cfg: Config, *, readonly=False):
+        path = cfg.root / "telegram_queue.db"
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("State database is missing or is a symlink; run --init in a fresh directory")
+        uri = path.resolve().as_uri() + ("?mode=ro" if readonly else "?mode=rw")
+        conn = sqlite3.connect(uri, uri=True, timeout=30, check_same_thread=False,
+                               isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @classmethod
+    def validate(cls, conn, cfg: Config):
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        if tables != set(cls.TABLES):
+            raise RuntimeError("Not a Telemax 3.5.0 database; use a fresh installation directory")
+        for table, columns in cls.TABLES.items():
+            actual = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if actual != columns:
+                raise RuntimeError(f"Invalid database layout: {table}")
+        meta = dict(conn.execute("SELECT key,value FROM tm_meta"))
+        if meta.get("schema") != SCHEMA_VERSION:
+            raise RuntimeError("Unsupported database schema; this build requires a 3.5.0 state database")
+        if meta.get("tg_chat_id") != str(cfg.chat_id):
+            raise RuntimeError("TG_CHAT_ID differs from this database; saved messages will not be rerouted")
+        if meta.get("tg_bot_id") != cfg.token.split(":", 1)[0]:
+            raise RuntimeError("Telegram bot differs from this database; use a separate installation")
+        if cfg.my_max_id and meta.get("max_account_id") not in {None, str(cfg.my_max_id)}:
+            raise RuntimeError("MY_MAX_ID differs from this database")
+
+    @classmethod
+    def check(cls, cfg: Config):
+        conn = cls.open_existing(cfg, readonly=True)
         try:
-            old = c.execute("SELECT value FROM tm_meta WHERE key='tg_chat_id'").fetchone()
-            if old and old[0] != str(self.cfg.chat_id):
-                raise RuntimeError("TG_CHAT_ID differs from this database; refusing to reroute saved messages")
-            if schema is None:
-                self._migrate(tables)
-            c.execute("INSERT OR REPLACE INTO tm_meta VALUES('schema','3')")
-            c.execute("INSERT OR REPLACE INTO tm_meta VALUES('tg_chat_id',?)", (str(self.cfg.chat_id),))
-            c.execute("UPDATE tm_jobs SET state='uncertain',error='Restart during external send; check delivery',"
-                      "updated=? WHERE state='running' AND phase='send'", (time.time(),))
-            c.execute("UPDATE tm_jobs SET state='pending',phase='',next_at=0 WHERE state='running'")
-            c.execute("UPDATE tm_routes SET state='uncertain' WHERE state='creating'")
-            c.commit()
+            cls.validate(conn, cfg)
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise RuntimeError("SQLite quick_check failed")
+        finally:
+            conn.close()
+
+    @classmethod
+    def create(cls, cfg: Config):
+        """Create one empty database. Never reuse, import, or reset an existing file."""
+        path = cfg.root / "telegram_queue.db"
+        for name in (str(path) + "-wal", str(path) + "-shm", str(path) + "-journal"):
+            if os.path.lexists(name):
+                raise RuntimeError("SQLite sidecar exists; use an empty installation directory")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            raise RuntimeError("Database already exists; --init never overwrites state") from exc
+        os.close(fd)
+        conn = None
+        try:
+            conn = sqlite3.connect(path, isolation_level=None)
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("BEGIN IMMEDIATE")
+            statements = (
+                "CREATE TABLE tm_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
+                "CREATE TABLE tm_routes(max_id TEXT PRIMARY KEY,thread_id INTEGER UNIQUE,"
+                "name TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'group',"
+                "state TEXT NOT NULL DEFAULT 'new' CHECK(state IN ('new','creating','ready','uncertain')))",
+                "CREATE TABLE tm_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL UNIQUE,"
+                "kind TEXT NOT NULL,route TEXT NOT NULL,payload TEXT NOT NULL,"
+                "state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN "
+                "('pending','running','done','dead','uncertain','cancelled')),phase TEXT NOT NULL DEFAULT '',"
+                "attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,"
+                "error TEXT NOT NULL DEFAULT '',result TEXT NOT NULL DEFAULT '{}',"
+                "created REAL NOT NULL,updated REAL NOT NULL)",
+                "CREATE INDEX tm_job_due ON tm_jobs(kind,state,next_at,id)",
+                "CREATE INDEX tm_job_route ON tm_jobs(kind,route,state,id)",
+                "CREATE INDEX tm_job_state ON tm_jobs(state,updated)",
+            )
+            for statement in statements:
+                conn.execute(statement)
+            conn.executemany("INSERT INTO tm_meta VALUES(?,?)", (
+                ("schema", SCHEMA_VERSION), ("created_by", VERSION),
+                ("tg_chat_id", str(cfg.chat_id)), ("tg_bot_id", cfg.token.split(":", 1)[0]),
+            ))
+            conn.commit()
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise RuntimeError("SQLite initialization verification failed")
+            conn.close()
+            conn = None
+            fsync_dir(cfg.root)
         except BaseException:
-            c.rollback()
+            if conn is not None:
+                conn.close()
+            path.unlink(missing_ok=True)
             raise
-        os.chmod(self.path, 0o600)
 
     @staticmethod
     def insert(c, key, job_kind, route, payload, state="pending", error=""):
@@ -366,64 +409,6 @@ class Store:
                          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(key) DO NOTHING""",
                         (key, job_kind, str(route), jdump(payload), state, error, now, now))
         return cur.lastrowid if cur.rowcount else None
-
-    def _migrate(self, tables: set[str]):
-        c = self.conn
-        if "settings" in tables:
-            status = c.execute("SELECT value FROM settings WHERE key='status_msg_id'").fetchone()
-            if status and number(status[0]):
-                c.execute("INSERT OR REPLACE INTO tm_meta VALUES('status_msg_id',?)", (str(status[0]),))
-        if "contacts" in tables:
-            c.execute("INSERT OR IGNORE INTO tm_aliases SELECT max_id,alias FROM contacts WHERE alias IS NOT NULL")
-        if "topics" in tables:
-            for r in c.execute("SELECT * FROM topics").fetchall():
-                target = str(r["max_chat_id"]).removeprefix("PRIVATE_")
-                if number(target) is None:
-                    continue
-                old = c.execute("SELECT thread_id FROM tm_routes WHERE max_id=?", (target,)).fetchone()
-                if old and old[0] != r["thread_id"]:
-                    raise RuntimeError(f"Ambiguous legacy topic mapping for MAX chat {target}")
-                occupied = c.execute("SELECT max_id FROM tm_routes WHERE thread_id=?", (r["thread_id"],)).fetchone()
-                if occupied and occupied[0] != target:
-                    raise RuntimeError(f"Legacy Telegram topic is assigned to multiple MAX chats: {r['thread_id']}")
-                c.execute("INSERT OR IGNORE INTO tm_routes VALUES(?,?,?,?,?)",
-                          (target, r["thread_id"], r["name"] or f"MAX {target}",
-                           r["type"] or "group", "ready" if r["thread_id"] else "new"))
-        live = {}
-        for table, initial in (("queue_v2", "pending"), ("queue_dead_letter", "dead")):
-            if table not in tables:
-                continue
-            for raw in c.execute(f"SELECT * FROM {table} ORDER BY id").fetchall():
-                r = dict(raw)
-                target = str(r.get("max_chat_id") or "").removeprefix("PRIVATE_")
-                route = c.execute("SELECT max_id FROM tm_routes WHERE thread_id=?", (r.get("thread_id"),)).fetchone()
-                if route:
-                    target = route[0]
-                state, reason = initial, str(r.get("reason") or "")
-                if table == "queue_dead_letter" and r["id"] in live:
-                    c.execute("UPDATE tm_jobs SET state='uncertain',error=? WHERE key LIKE ?",
-                              ("Legacy job exists in both queue and DLQ; check delivery",
-                               f"legacy:{r['id']}:%"))
-                    continue
-                if number(target) is None:
-                    state, reason = "dead", "Legacy route missing; cannot send to the general chat"
-                try:
-                    legacy_files = json.loads(r.get("file_data") or "[]") or []
-                    if not isinstance(legacy_files, list):
-                        raise ValueError("Invalid legacy file list")
-                    files = [{"source": "legacy", "path": f["path"],
-                              "name": Path(f["path"]).name,
-                              "kind": media_kind(f.get("ext", ""))} for f in legacy_files]
-                    parts = tg_parts(plain_legacy(r.get("text_data") or ""), files)
-                    if not parts:
-                        raise ValueError("Empty legacy job")
-                except (ValueError, TypeError, KeyError):
-                    parts = [{"invalid_legacy": r}]
-                    state, reason = "dead", "Invalid legacy payload retained for recovery"
-                for i, part in enumerate(parts):
-                    self.insert(c, f"legacy:{r['id']}:{i}", "to_tg", target, part, state, reason)
-                live[r["id"]] = True
-        # Old tables are deliberately retained, but only tm_* tables are authoritative.
 
     async def tx(self, fn: Callable):
         def run():
@@ -478,7 +463,7 @@ class Store:
                     is_command = text.startswith("/") and bool(msg.get("text"))
                     thread = msg.get("message_thread_id")
                     has_content = text or any(msg.get(k) for k in
-                        ("photo", "document", "video", "voice", "audio", "animation", "sticker", "video_note", "contact", "location", "poll"))
+                        ("photo", "document", "video", "voice", "audio", "animation", "sticker", "video_note", "contact", "location", "poll", "venue", "dice"))
                     if is_command or (thread and has_content):
                         if not is_command:
                             self.capacity(c)
@@ -540,7 +525,7 @@ class Store:
             state, next_at, attempts = "dead", 0, job["attempts"]
         reason = str(exc)[:1000]
         # Error messages may contain URLs or credentials; never save those as diagnostics.
-        for secret in (self.cfg.token, self.cfg.phone, self.cfg.ntfy):
+        for secret in (self.cfg.token, self.cfg.phone, self.cfg.ntfy, self.cfg.proxy):
             if secret:
                 reason = reason.replace(secret, "[redacted]")
         reason = re.sub(r"https?://\S+", "[URL redacted]", reason)
@@ -576,10 +561,13 @@ def decode_api(code: int, body: bytes) -> ApiResult:
         if data.get("ok") is True:
             return ApiResult(ok=True, result=data.get("result"))
         n = int(data.get("error_code") or 0)
-        retry = max(0, float((data.get("parameters") or {}).get("retry_after") or 0))
+        retry = float((data.get("parameters") or {}).get("retry_after") or 0)
+        if not math.isfinite(retry):
+            raise ValueError("Non-finite retry interval")
+        retry = max(0, retry)
         return ApiResult(code=n, error=str(data.get("description") or "Invalid Telegram response"),
                          retry_after=retry, ambiguous=n == 0 or n >= 500)
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         return ApiResult(error="Invalid Telegram JSON response", ambiguous=True)
 
 
@@ -690,7 +678,7 @@ class Curl:
 
     @staticmethod
     def base(url: str, timeout: int, proxy: str | None) -> list[tuple[str, Any]]:
-        return [("url", url), ("silent", ""), ("show-error", ""),
+        return [("url", url), ("globoff", ""), ("silent", ""), ("show-error", ""),
                 ("max-time", timeout), ("connect-timeout", 15),
                 ("proto", "=https"), ("proxy", proxy or ""),
                 ("noproxy", "" if proxy else "*")]
@@ -741,8 +729,12 @@ async def public_resolve(url: str) -> tuple[str, str]:
     """Pin a public address for each HTTPS hop, preventing DNS rebinding to LAN."""
     if any(ord(c) < 33 for c in url):
         raise Permanent("Invalid media URL")
-    u = urlsplit(url)
-    if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in {None, 443}:
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except ValueError as exc:
+        raise Permanent("Invalid media URL") from exc
+    if u.scheme != "https" or not u.hostname or u.username or u.password or port not in {None, 443}:
         raise Permanent("Only public HTTPS media URLs on port 443 are allowed")
     host = u.hostname.encode("idna").decode("ascii")
     try:
@@ -806,6 +798,9 @@ class Downloads:
             raise Permanent("File exceeds the configured/API download limit")
         async with self.lock:
             if path.exists() and path.stat().st_size > 0:
+                size = path.stat().st_size
+                if size > limit or (expected is not None and size != expected):
+                    raise Permanent("Cached file violates size/length checks; retained for inspection")
                 return path
             await asyncio.to_thread(self.check_budget, limit)
             for _ in range(6):
@@ -819,7 +814,7 @@ class Downloads:
                     else:
                         host, address = await public_resolve(url)
                         opts.append(("resolve", f"{host}:443:{address}"))
-                    opts.extend([("dump-header", str(head)), ("user-agent", "Telemax/3")])
+                    opts.extend([("dump-header", str(head)), ("user-agent", f"Telemax/{VERSION}")])
                     try:
                         rc, _, size = await self.curl.run(opts, 300, part, limit)
                     except (OSError, asyncio.TimeoutError) as exc:
@@ -864,7 +859,7 @@ def normalize_attachment(attach: Any, chat_id, message_id) -> dict:
             "name", "file_name", "size", "file_size", "url", "base_url", "file_url",
             "download_url", "token", "duration", "title", "text", "first_name", "phone")
     data = {k: get(attach, k) for k in keys if isinstance(get(attach, k), (str, int, float, bool))}
-    data["type"] = kind(get(attach, "type"))
+    data["type"] = kind(get(attach, "type") or get(attach, "_type"))
     data["source"], data["chat_id"], data["message_id"] = "max", chat_id, message_id
     return data
 
@@ -969,9 +964,6 @@ class Bridge:
         sid = number(sender)
         if sid is None:
             return "Система"
-        rows = await self.store.read("SELECT alias FROM tm_aliases WHERE max_id=?", (str(sid),))
-        if rows:
-            return rows[0]["alias"]
         try:
             user = await asyncio.wait_for(self.client.get_user(sid), 5)
             name = " ".join(str(get(user, x) or "") for x in ("first_name", "last_name")).strip()
@@ -1056,6 +1048,8 @@ class Bridge:
                     "name": safe_name(obj.get("file_name"), default),
                     "kind": {"photo": "photo", "video": "video", "voice": "voice", "video_note": "video_note"}.get(typ, "document"),
                     "size": obj.get("file_size"), "duration": obj.get("duration")}
+        if any(msg.get(field) for field in ("contact", "location", "poll", "venue", "dice")):
+            raise Permanent("Unsupported Telegram content; original update retained")
         if not text and not file:
             raise Permanent("Unsupported Telegram content; original update retained")
         origin = {"parent": job["key"], "message_id": msg["message_id"],
@@ -1099,17 +1093,23 @@ class Bridge:
         for index, f in enumerate(data.get("files") or []):
             if f.get("unsupported"):
                 raise Permanent(f"Unsupported MAX attachment type: {f['unsupported']}")
+            if f.get("source") not in {"max", "telegram"}:
+                raise Permanent("Unsupported media source; descriptor retained")
             if "path" not in f:
                 f["path"] = str(self.cfg.media / f"tm_{job['id']}_{index}_{safe_name(f.get('name'))}")
                 await self.store.payload(job, data)  # Reference exists BEFORE the file does.
             path = self.downloads.checked_path(f["path"])
             if path.exists() and path.stat().st_size > 0:
-                if path.stat().st_size > self.cfg.max_file_bytes:
+                size = path.stat().st_size
+                limit = (self.cfg.max_tg_download_bytes if f["source"] == "telegram"
+                         else self.cfg.max_file_bytes)
+                if size > limit:
                     raise Permanent("Local attachment exceeds configured size limit")
+                expected = number(f.get("size")) if f["source"] == "telegram" else None
+                if expected is not None and size != expected:
+                    raise Permanent("Local attachment length mismatch; retained for inspection")
                 paths.append(path)
                 continue
-            if f.get("source") == "legacy":
-                raise Permanent("Legacy media file missing/empty; retained in DLQ, NOT acknowledged as sent")
             if f.get("source") == "telegram":
                 response = await self.tg.call("getFile", {"file_id": f["file_id"]})
                 info = require_api(response)
@@ -1144,8 +1144,6 @@ class Bridge:
         return paths
 
     async def send_tg(self, job: dict, data: dict):
-        if data.get("invalid_legacy"):
-            raise Permanent("Legacy payload needs manual repair")
         thread = await self.ensure_topic(job["route"])
         paths = await self.materialize(job, data)
         params = {"chat_id": self.cfg.chat_id, "message_thread_id": thread}
@@ -1191,7 +1189,8 @@ class Bridge:
             raise Retry("Telegram topic was deleted; route retained, topic will be recreated", 5)
         result = require_api(response, sending=True)
         delivered = result if isinstance(result, list) else [result]
-        if not delivered or any(not get(x, "message_id") for x in delivered):
+        if (not delivered or any(not get(x, "message_id") for x in delivered)
+                or (method == "sendMediaGroup" and len(delivered) != len(paths))):
             raise Uncertain("Telegram accepted request without expected message IDs")
         await self.store.finish(job, {"ids": [get(x, "message_id") for x in delivered]})
         await self.store.set_meta("tg_delivered", time.time())
@@ -1343,9 +1342,6 @@ class Bridge:
         elif job["kind"] == "reaction":
             method, params = "setMessageReaction", {"chat_id": self.cfg.chat_id,
                 "message_id": data["message_id"], "reaction": [{"type": "emoji", "emoji": "⚡"}]}
-        elif job["kind"] == "edit_status":
-            method, params = "editMessageText", {"chat_id": self.cfg.chat_id,
-                "message_id": data["message_id"], "text": await self.status_text()}
         else:
             method, params = "editForumTopic", {"chat_id": self.cfg.chat_id,
                 "message_thread_id": data["thread"], "name": data["name"]}
@@ -1354,11 +1350,7 @@ class Bridge:
                 await self.store.phase(job, "send")
             return await self.tg.call(method, params, timeout=30)
         response = await self.tg.paced(call)
-        if job["kind"] in {"edit_topic", "edit_status"} and response.code == 400 and "not modified" in response.error.lower():
-            await self.store.finish(job)
-            return
-        if job["kind"] == "edit_status" and response.code == 400 and "not found" in response.error.lower():
-            await self.store.set_meta("status_msg_id", "")
+        if job["kind"] == "edit_topic" and response.code == 400 and "not modified" in response.error.lower():
             await self.store.finish(job)
             return
         require_api(response, sending=job["kind"] == "notice")
@@ -1411,6 +1403,8 @@ class Bridge:
             try:
                 if not self.tg.username:
                     me = require_api(await self.tg.call("getMe"))
+                    if str(get(me, "id")) != self.cfg.token.split(":", 1)[0]:
+                        raise RuntimeError("Telegram returned an unexpected bot identity")
                     self.tg.username = str(get(me, "username") or "")
                 offset = int(await self.store.meta("tg_offset", "0"))
                 result = require_api(await self.tg.call("getUpdates", {
@@ -1462,10 +1456,6 @@ class Bridge:
     async def maintenance(self):
         last_alert = 0.0
         while not self.stop.is_set():
-            old_status = await self.store.meta("status_msg_id")
-            if old_status:
-                await self.store.add(f"status:{int(time.time() // 1800)}", "edit_status", "status",
-                                     {"message_id": int(old_status)})
             cutoff = time.time() - self.cfg.history_days * 86400
             # Keep small deduplication tombstones, discard old completed message bodies.
             await self.store.tx(lambda c: c.execute("UPDATE tm_jobs SET payload='{}',error='' WHERE state IN ('done','cancelled') AND updated<? AND payload!='{}'", (cutoff,)).rowcount)
@@ -1498,7 +1488,10 @@ class Bridge:
         try:
             opts = self.curl.base(self.cfg.ntfy, 10, None)
             opts.extend([("proto", "=https,http"), ("header", "Title: Telemax"), ("data-binary", text)])
-            await self.curl.run(opts, 10, limit=1024 * 1024)
+            opts.append(("fail", ""))
+            code, _, _ = await self.curl.run(opts, 10, limit=1024 * 1024)
+            if code:
+                LOG.warning("NTFY alert rejected or unreachable (curl %s)", code)
         except Exception:
             LOG.warning("NTFY alert could not be sent")
 
@@ -1510,7 +1503,7 @@ class Bridge:
             loop.add_signal_handler(sig, self.stop.set)
         coros = {"max-client": self.client.start(), "tg-poll": self.polling(),
                  "health": self.health(), "watchdog": self.watchdog(), "maintenance": self.maintenance()}
-        for name in ("max_in", "tg_in", "to_tg", "to_max", "command", "notice", "reaction", "edit_topic", "edit_status"):
+        for name in ("max_in", "tg_in", "to_tg", "to_max", "command", "notice", "reaction", "edit_topic"):
             coros[name] = self.worker(name)
         tasks = [asyncio.create_task(coro, name=name) for name, coro in coros.items()]
         stop_task = asyncio.create_task(self.stop.wait(), name="stop")
@@ -1588,542 +1581,78 @@ async def serve(cfg: Config, client, classes):
         await store.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Telemax MAX ↔ Telegram bridge")
-    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent / "constants.json")
-    parser.add_argument("--check-config", action="store_true", help="Validate configuration and SDK; do not connect or migrate")
-    parser.add_argument("--self-test", action="store_true", help="Run isolated checks; no credentials or network needed")
-    args = parser.parse_args()
-    if args.self_test:
-        return self_test()
-    cfg = Config.load(args.config)
-    if not shutil.which("curl"):
-        raise RuntimeError("curl executable is required")
-    Client, ExtraConfig, classes = load_sdk()
-    if args.check_config:
-        print(f"OK: configuration; maxapi-python=={SDK_VERSION}; curl")
-        if not cfg.allowed and not cfg.admins:
-            print("WARNING: Telegram → MAX and commands are disabled until user IDs are configured")
-        return 0
-    os.umask(0o077)
-    cfg.media.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cache = cfg.root / "session_cache"
-    cache.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(cfg.media, 0o700)
-    os.chmod(cache, 0o700)
-    os.chmod(args.config, 0o600)
-    with open(cfg.root / ".telemax.lock", "a") as lock:
+@contextlib.contextmanager
+def instance_lock(root: Path):
+    path = root / ".telemax.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError("Another updated Telemax process is already running") from exc
-        # MAX must never inherit a proxy. Telegram's proxy is explicit in every call.
+            raise RuntimeError("Another Telemax process is running in this directory") from exc
+        yield
+
+
+def prepare_directories(cfg: Config):
+    for directory in (cfg.media, cfg.root / "session_cache"):
+        if directory.is_symlink():
+            raise RuntimeError("Runtime directories must not be symlinks")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=f"Telemax {VERSION} MAX ↔ Telegram bridge")
+    parser.add_argument("--version", action="version", version=f"Telemax {VERSION}")
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).resolve().parent / "constants.json")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--init", action="store_true",
+                         help="Create empty 3.5.0 state; refuses existing DB; no SDK/network required")
+    actions.add_argument("--check-config", action="store_true",
+                         help="Validate configuration, SDK and curl; no DB access or network")
+    actions.add_argument("--check", action="store_true",
+                         help="Check configuration/SDK and existing database without changing queue state")
+    args = parser.parse_args()
+    cfg = Config.load(args.config)
+    if args.init:
+        os.umask(0o077)
+        with instance_lock(cfg.root):
+            if os.path.lexists(cfg.root / "telegram_queue.db"):
+                raise RuntimeError("Database already exists; --init never overwrites state")
+            prepare_directories(cfg)
+            Store.create(cfg)
+        print(f"Initialized Telemax {VERSION}: {cfg.root / 'telegram_queue.db'}")
+        return 0
+    if not shutil.which("curl"):
+        raise RuntimeError("curl executable is required")
+    Client, ExtraConfig, classes = load_sdk()
+    if args.check_config or args.check:
+        if args.check:
+            Store.check(cfg)
+        print(f"OK: Telemax {VERSION}; configuration; maxapi-python=={SDK_VERSION}; curl"
+              + ("; state database" if args.check else ""))
+        if not cfg.allowed and not cfg.admins:
+            print("WARNING: Telegram → MAX and commands disabled: no authorized user IDs")
+        return 0
+    os.umask(0o077)
+    with instance_lock(cfg.root):
+        # Validate before authentication or a network call, and never change another release's DB.
+        Store.check(cfg)
+        prepare_directories(cfg)
+        os.chmod(args.config, 0o600)
+        # All MAX network paths must not inherit an application-level proxy.
         for key in list(os.environ):
             if key.lower().endswith("_proxy"):
                 del os.environ[key]
-        client = Client(phone=cfg.phone, work_dir=str(cache), extra_config=ExtraConfig(proxy=None))
-        configure_logging(cfg)  # After SDK construction, which can configure logging.
+        client = Client(phone=cfg.phone, work_dir=str(cfg.root / "session_cache"),
+                        extra_config=ExtraConfig(proxy=None))
+        configure_logging(cfg)
         LOG.info("Starting Telemax %s", VERSION)
         if not cfg.allowed and not cfg.admins:
             LOG.warning("Telegram → MAX and all commands disabled: no authorized user IDs")
         asyncio.run(serve(cfg, client, classes))
     return 0
-
-
-def self_test() -> int:
-    """Regression checks against real temporary SQLite databases and mocked APIs."""
-    import unittest
-    from types import SimpleNamespace as NS
-    from unittest.mock import AsyncMock, patch
-
-    class Attachment:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    class UnitTests(unittest.TestCase):
-        def test_utf16_split_preserves_all_text(self):
-            text = ("А<&>🙂\n" * 1500) + "fin"
-            pieces = split_text(text)
-            self.assertEqual("".join(pieces), text)
-            self.assertTrue(all(utf16len(p) <= 4000 for p in pieces))
-
-        def test_long_caption_becomes_separate_text(self):
-            parts = tg_parts("я" * 5000, [{"kind": "photo"}])
-            self.assertEqual([len(x["text"]) for x in parts], [4000, 1000, 0])
-            self.assertEqual(len(parts[-1]["files"]), 1)
-
-        def test_album_partition(self):
-            parts = tg_parts("caption", [{"kind": "photo"}] * 21)
-            self.assertEqual([len(p["files"]) for p in parts], [10, 10, 1])
-            self.assertEqual([p["text"] for p in parts], ["caption", "", ""])
-
-        def test_plain_legacy_preserves_user_markup(self):
-            self.assertEqual(plain_legacy("<b>[Имя]:</b>\n&lt;script&gt;&amp;"), "[Имя]:\n<script>&")
-
-        def test_no_text_based_echo_filter(self):
-            self.assertFalse(own_message({"sender": 2, "chat_id": 77, "text": "OK"}, 1))
-            self.assertFalse(own_message({"sender": 3, "chat_id": 88, "text": "OK"}, 1))
-            self.assertTrue(own_message({"sender": "1", "text": "OK"}, 1))
-
-        def test_authorization(self):
-            cfg = Config(Path("."), "+70000000000", "123:x", -100, frozenset({7}), frozenset({8}))
-            msg = {"chat": {"id": -100}, "from": {"id": 7}}
-            self.assertTrue(cfg.authorized(msg))
-            self.assertFalse(cfg.authorized(msg, admin=True))
-            for change in ({"from": {"id": 9}}, {"from": {"id": 7, "is_bot": True}},
-                           {"sender_chat": {"id": -99}}, {"chat": {"id": -200}},
-                           {"is_automatic_forward": True}):
-                self.assertFalse(cfg.authorized({**msg, **change}))
-            self.assertTrue(cfg.authorized({**msg, "from": {"id": 8}}, admin=True))
-
-        def test_empty_allowlist_denies(self):
-            cfg = Config(Path("."), "+70000000000", "123:x", -100)
-            self.assertFalse(cfg.authorized({"chat": {"id": -100}, "from": {"id": 7}}))
-
-        def test_missing_chat_id_is_not_string_none(self):
-            with tempfile.TemporaryDirectory() as d:
-                p = Path(d) / "constants.json"
-                for chat in (None, "None", "", True, 0, 1):
-                    p.write_text(jdump({"MAX_PHONE": "+70000000000", "TG_BOT_TOKEN": "123:x", "TG_CHAT_ID": chat}))
-                    with self.assertRaises(ValueError):
-                        Config.load(p)
-
-        def test_invalid_allowlist_and_valid_config(self):
-            with tempfile.TemporaryDirectory() as d:
-                p = Path(d) / "constants.json"
-                obj = {"MAX_PHONE": "+70000000000", "TG_BOT_TOKEN": "123:x", "TG_CHAT_ID": "-100"}
-                p.write_text(jdump({**obj, "TG_ALLOWED_USER_IDS": [True]}))
-                with self.assertRaises(ValueError):
-                    Config.load(p)
-                p.write_text(jdump({**obj, "TG_ALLOWED_USER_IDS": [7], "TG_ADMIN_USER_IDS": [7]}))
-                self.assertEqual(Config.load(p).allowed, frozenset({7}))
-
-        def test_api_429_is_retryable(self):
-            response = decode_api(0, b'{"ok":false,"error_code":429,"parameters":{"retry_after":31}}')
-            with self.assertRaises(Retry) as cm:
-                require_api(response, sending=True)
-            self.assertEqual(cm.exception.delay, 31)
-            self.assertFalse(cm.exception.count)
-
-        def test_transport_timeout_is_uncertain_only_for_sends(self):
-            result = decode_api(28, b"")
-            with self.assertRaises(Uncertain):
-                require_api(result, sending=True)
-            with self.assertRaises(Retry):
-                require_api(result, sending=False)
-
-        def test_connect_failure_is_retryable(self):
-            with self.assertRaises(Retry):
-                require_api(decode_api(7, b""), sending=True)
-
-        def test_bad_request_never_becomes_success(self):
-            result = decode_api(0, b'{"ok":false,"error_code":400,"description":"bad input"}')
-            self.assertFalse(result.ok)
-            with self.assertRaises(Permanent):
-                require_api(result)
-
-        def test_invalid_json_after_send_is_uncertain(self):
-            with self.assertRaises(Uncertain):
-                require_api(decode_api(0, b"not json"), sending=True)
-
-        def test_config_curl_does_not_expand_newline_options(self):
-            self.assertEqual(curl_quote('x"\ny'), '"x\\"\\ny"')
-            self.assertNotIn("\n", curl_quote('x"\ny'))
-
-        def test_header_parser_uses_final_response(self):
-            status, headers = parse_headers("HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200\r\nContent-Length: 3\r\n\r\n")
-            self.assertEqual(status, 200)
-            self.assertEqual(headers["content-length"], "3")
-
-        def test_safe_name(self):
-            self.assertEqual(safe_name("../../secret.txt"), "secret.txt")
-            self.assertNotIn(";", safe_name('evil.jpg;type=text/html'))
-            self.assertLessEqual(len(safe_name("я" * 1000 + ".jpg").encode()), 150)
-
-        def test_forwarded_media_keeps_source_context(self):
-            data = normalize_message(NS(id=1, chat_id=100, text="", sender=2, attaches=[],
-                link=NS(type="FORWARD", chat_id=200, message=NS(id=3, chat_id=None, text="fwd", attaches=[NS(type="FILE", file_id=9)]))))
-            self.assertEqual(data["forward"]["files"][0]["chat_id"], 200)
-            self.assertEqual(data["forward"]["files"][0]["message_id"], 3)
-
-        def test_log_redaction(self):
-            formatter = RedactedFormatter(["123:secret"])
-            record = logging.LogRecord("test", 40, "", 1, "123:secret https://host/token?q=private", (), None)
-            text = formatter.format(record)
-            self.assertNotIn("secret", text)
-            self.assertNotIn("private", text)
-
-    class AsyncTests(unittest.IsolatedAsyncioTestCase):
-        async def asyncSetUp(self):
-            self.tmp = tempfile.TemporaryDirectory()
-            root = Path(self.tmp.name)
-            self.cfg = Config(root, "+70000000000", "123:test", -100,
-                              frozenset({7}), frozenset({7}), my_max_id=1,
-                              max_file_bytes=10000, max_tg_download_bytes=10000,
-                              disk_limit=1000000, min_free=1)
-            self.cfg.media.mkdir()
-            self.store = Store(self.cfg)
-            self.client = NS(get_user=AsyncMock(return_value=NS(first_name="Name", last_name="")),
-                             get_chat=AsyncMock(return_value=NS(title="Group", type="CHAT")),
-                             send_message=AsyncMock(return_value=NS(id=900)),
-                             get_file_by_id=AsyncMock(return_value=NS(url="https://cdn.example.test/file")),
-                             fetch_users=AsyncMock(return_value=[]))
-            self.bridge = Bridge(self.cfg, self.store, self.client,
-                                 {k: Attachment for k in ("photo", "video", "document", "voice", "video_note")})
-            self.bridge.own_id = 1
-            self.bridge.max_ready.set()
-            self.bridge.max_available.set()
-            self.bridge.tg.username = "test_bot"
-            self.bridge.tg.call = AsyncMock(return_value=ApiResult(ok=True, result={"message_id": 55}))
-            async def immediate(callback):
-                return await callback()
-            self.bridge.tg.paced = immediate
-            await self.store.tx(lambda c: c.execute("INSERT INTO tm_routes VALUES('100',42,'Group','group','ready')"))
-
-        async def asyncTearDown(self):
-            await self.store.close()
-            self.tmp.cleanup()
-
-        async def job(self, kind_, payload, route="100", key=None):
-            await self.store.add(key or uuid.uuid4().hex, kind_, route, payload)
-            row = await self.store.claim(kind_)
-            self.assertIsNotNone(row)
-            row["phase"] = ""
-            return row
-
-        def tgmsg(self, text="hello", **fields):
-            return {"message_id": 10, "message_thread_id": 42, "chat": {"id": -100},
-                    "from": {"id": 7}, "text": text, **fields}
-
-        async def state(self, job):
-            return (await self.store.read("SELECT * FROM tm_jobs WHERE id=?", (job["id"],)))[0]
-
-        async def test_durable_deduplication(self):
-            self.assertTrue(await self.store.add("max:100:1", "max_in", "100", {"text": "OK"}))
-            self.assertFalse(await self.store.add("max:100:1", "max_in", "100", {"text": "OK"}))
-            self.assertTrue(await self.store.add("max:200:1", "max_in", "200", {"text": "OK"}))
-            self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs")), 2)
-
-        async def test_claim_is_atomic(self):
-            await self.store.add("one", "to_tg", "100", {"text": "x"})
-            first, second = await asyncio.gather(self.store.claim("to_tg"), self.store.claim("to_tg"))
-            self.assertEqual(sum(x is not None for x in (first, second)), 1)
-
-        async def test_backoff_does_not_block_another_chat(self):
-            job = await self.job("to_tg", {"text": "first"})
-            await self.store.fail(job, Retry("outage", 300))
-            await self.store.add("same", "to_tg", "100", {"text": "later"})
-            await self.store.add("different", "to_tg", "200", {"text": "other"})
-            row = await self.store.claim("to_tg")
-            self.assertEqual(row["route"], "200")
-
-        async def test_offset_and_target_are_saved_together(self):
-            await self.store.accept_updates([{"update_id": 21, "message": self.tgmsg()}])
-            await self.store.tx(lambda c: c.execute("UPDATE tm_routes SET max_id='200' WHERE thread_id=42"))
-            job = (await self.store.read("SELECT * FROM tm_jobs"))[0]
-            self.assertEqual(json.loads(job["payload"])["target"], "100")
-            self.assertEqual(await self.store.meta("tg_offset"), "22")
-
-        async def test_updates_are_sorted_before_acknowledging(self):
-            await self.store.accept_updates([{"update_id": 5, "message": self.tgmsg()}, {"update_id": 4, "message": self.tgmsg("earlier")}])
-            self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs")), 2)
-            self.assertEqual(await self.store.meta("tg_offset"), "6")
-
-        async def test_unauthorized_updates_do_not_create_jobs(self):
-            msg = self.tgmsg("/clear_dlq confirm", **{"from": {"id": 999}})
-            await self.store.accept_updates([{"update_id": 9, "message": msg}])
-            self.assertFalse(await self.store.read("SELECT * FROM tm_jobs"))
-            self.assertEqual(await self.store.meta("tg_offset"), "10")
-
-        async def test_failed_transaction_does_not_advance_offset(self):
-            with patch.object(Store, "insert", side_effect=RuntimeError("injected")):
-                with self.assertRaises(RuntimeError):
-                    await self.store.accept_updates([{"update_id": 8, "message": self.tgmsg()}])
-            self.assertEqual(await self.store.meta("tg_offset"), "")
-            self.assertFalse(await self.store.read("SELECT * FROM tm_jobs"))
-
-        async def test_missing_file_is_not_success(self):
-            data = {"text": "caption", "files": [{"source": "legacy", "kind": "document", "path": str(self.cfg.media / "missing.bin")}]}
-            job = await self.job("to_tg", data)
-            with self.assertRaises(Permanent):
-                await self.bridge.send_tg(job, data)
-            self.bridge.tg.call.assert_not_awaited()
-            self.assertNotEqual((await self.state(job))["state"], "done")
-
-        async def test_shared_legacy_file_is_not_deleted_after_first_send(self):
-            path = self.cfg.media / "shared.jpg"
-            path.write_bytes(b"image")
-            data = {"text": "caption", "files": [{"source": "legacy", "kind": "photo", "path": str(path)}]}
-            first = await self.job("to_tg", data, key="first")
-            await self.store.add("second", "to_tg", "100", data)
-            await self.bridge.send_tg(first, data)
-            self.assertTrue(path.exists())
-            second = await self.store.claim("to_tg")
-            await self.bridge.send_tg(second, json.loads(second["payload"]))
-            self.assertEqual(self.bridge.tg.call.await_count, 2)
-            self.assertEqual((await self.state(second))["state"], "done")
-
-        async def test_partial_album_is_not_sent(self):
-            path = self.cfg.media / "present.jpg"
-            path.write_bytes(b"image")
-            data = {"text": "caption", "files": [
-                {"source": "legacy", "kind": "photo", "path": str(path)},
-                {"source": "legacy", "kind": "photo", "path": str(self.cfg.media / "missing.jpg")}]}
-            job = await self.job("to_tg", data)
-            with self.assertRaises(Permanent):
-                await self.bridge.send_tg(job, data)
-            self.bridge.tg.call.assert_not_awaited()
-
-        async def test_html_is_sent_as_literal_text(self):
-            data = {"text": "<b>A & B</b>", "files": []}
-            job = await self.job("to_tg", data)
-            await self.bridge.send_tg(job, data)
-            params = self.bridge.tg.call.call_args.args[1]
-            self.assertEqual(params["text"], data["text"])
-            self.assertNotIn("parse_mode", params)
-
-        async def test_429_stays_pending_without_attempt_increment(self):
-            data = {"text": "test", "files": []}
-            job = await self.job("to_tg", data)
-            self.bridge.tg.call.return_value = ApiResult(code=429, retry_after=50)
-            with self.assertRaises(Retry) as cm:
-                await self.bridge.send_tg(job, data)
-            await self.store.fail(job, cm.exception)
-            row = await self.state(job)
-            self.assertEqual(row["state"], "pending")
-            self.assertEqual(row["attempts"], 0)
-            self.assertGreaterEqual(row["next_at"], time.time() + 49)
-
-        async def test_topic_deletion_never_falls_back_to_general_chat(self):
-            data = {"text": "test", "files": []}
-            job = await self.job("to_tg", data)
-            self.bridge.tg.call.return_value = ApiResult(code=400, error="Bad Request: message thread not found")
-            with self.assertRaises(Retry):
-                await self.bridge.send_tg(job, data)
-            row = (await self.store.read("SELECT * FROM tm_routes"))[0]
-            self.assertIsNone(row["thread_id"])
-            self.assertEqual(row["max_id"], "100")
-            self.assertEqual(self.bridge.tg.call.call_args.args[1]["message_thread_id"], 42)
-
-        async def test_ambiguous_topic_creation_is_not_repeated(self):
-            await self.store.tx(lambda c: c.execute("UPDATE tm_routes SET thread_id=NULL,state='new'"))
-            self.bridge.tg.call.return_value = ApiResult(ambiguous=True, error="timeout")
-            for _ in range(2):
-                with self.assertRaises(Permanent):
-                    await self.bridge.ensure_topic("100")
-            self.assertEqual(self.bridge.tg.call.await_count, 1)
-            row = (await self.store.read("SELECT * FROM tm_routes"))[0]
-            self.assertEqual(row["state"], "uncertain")
-
-        async def test_max_receives_text_and_attachment_in_one_call(self):
-            path = self.cfg.media / "file.pdf"
-            path.write_bytes(b"pdf")
-            data = {"text": "caption", "files": [{"source": "telegram", "kind": "document", "path": str(path)}],
-                    "origin": {"sender": 7, "parent": "tg:101", "message_id": 101}}
-            job = await self.job("to_max", data, key="tg:101/0")
-            await self.bridge.send_max(job, data)
-            self.client.send_message.assert_awaited_once()
-            call = self.client.send_message.call_args.kwargs
-            self.assertEqual(call["chat_id"], 100)
-            self.assertEqual(call["text"], "caption")
-            self.assertEqual(call["attachments"][0].kwargs["path"], str(path))
-            self.assertEqual((await self.state(job))["state"], "done")
-            self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs WHERE kind='reaction'")), 1)
-
-        async def test_uncertain_max_send_is_not_automatically_retried(self):
-            data = {"text": "hello", "files": [], "origin": {"sender": 7}}
-            job = await self.job("to_max", data)
-            self.client.send_message.side_effect = ConnectionError("injected")
-            with self.assertRaises(Uncertain) as cm:
-                await self.bridge.send_max(job, data)
-            await self.store.fail(job, cm.exception)
-            self.assertEqual((await self.state(job))["state"], "uncertain")
-            self.assertIsNone(await self.store.claim("to_max"))
-            self.client.send_message.assert_awaited_once()
-
-        async def test_revoked_sender_cannot_send_saved_job(self):
-            self.bridge.cfg = dataclasses.replace(self.cfg, allowed=frozenset(), admins=frozenset())
-            data = {"text": "hello", "files": [], "origin": {"sender": 7}}
-            job = await self.job("to_max", data)
-            with self.assertRaises(Permanent):
-                await self.bridge.send_max(job, data)
-            self.client.send_message.assert_not_awaited()
-
-        async def test_reaction_waits_for_all_text_parts(self):
-            payload = {"message": self.tgmsg("X" * 5000), "target": "100"}
-            parent = await self.job("tg_in", payload, key="tg:500")
-            await self.bridge.prepare_tg(parent, payload)
-            a = await self.store.claim("to_max")
-            await self.bridge.send_max(a, json.loads(a["payload"]))
-            self.assertFalse(await self.store.read("SELECT * FROM tm_jobs WHERE kind='reaction'"))
-            b = await self.store.claim("to_max")
-            await self.bridge.send_max(b, json.loads(b["payload"]))
-            self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs WHERE kind='reaction'")), 1)
-
-        async def test_restart_classifies_interrupted_sends(self):
-            sending = await self.job("to_tg", {"text": "x"}, key="sending")
-            await self.store.phase(sending, "send")
-            preparing = await self.job("max_in", {"id": 1}, key="preparing")
-            await self.store.close()
-            self.store = Store(self.cfg)
-            self.assertEqual((await self.state(sending))["state"], "uncertain")
-            self.assertEqual((await self.state(preparing))["state"], "pending")
-
-        async def test_dlq_retry_excludes_uncertain_without_force(self):
-            dead = await self.job("to_tg", {"text": "x"}, key="dead")
-            await self.store.fail(dead, Permanent("bad"))
-            unknown = await self.job("to_tg", {"text": "y"}, key="unknown")
-            await self.store.fail(unknown, Uncertain("timeout"))
-            cmddata = {"message": self.tgmsg("/retry_dlq")}
-            cmd = await self.job("command", cmddata)
-            await self.bridge.execute_command(cmd, cmddata)
-            self.assertEqual((await self.state(dead))["state"], "pending")
-            self.assertEqual((await self.state(unknown))["state"], "uncertain")
-            forcedata = {"message": self.tgmsg(f"/retry_dlq {unknown['id']} force")}
-            force = await self.job("command", forcedata)
-            await self.bridge.execute_command(force, forcedata)
-            self.assertEqual((await self.state(unknown))["state"], "pending")
-
-        async def test_dlq_clear_does_not_touch_later_failure(self):
-            before = await self.job("to_tg", {"text": "x"}, key="before")
-            await self.store.fail(before, Permanent("old failure"))
-            data = {"message": self.tgmsg("/clear_dlq confirm")}
-            command = await self.job("command", data)
-            await self.bridge.execute_command(command, data)
-            later = await self.job("to_tg", {"text": "y"}, key="later")
-            await self.store.fail(later, Permanent("new failure"))
-            self.assertEqual((await self.state(before))["state"], "cancelled")
-            self.assertEqual((await self.state(later))["state"], "dead")
-
-        async def test_tg_429_cooldown_is_persisted(self):
-            curl = NS(base=Curl.base, run=AsyncMock(return_value=(0, b'{"ok":false,"error_code":429,"parameters":{"retry_after":45}}', 1)))
-            tg = Telegram(self.cfg, self.store, curl)
-            await tg.call("getMe")
-            await tg.call("getMe")
-            self.assertEqual(curl.run.await_count, 1)
-            self.assertGreater(float(await self.store.meta("tg_pause_until")), time.time() + 40)
-            self.assertEqual(dict(curl.run.call_args.args[0])["proxy"], self.cfg.proxy)
-            self.assertEqual(dict(curl.run.call_args.args[0])["noproxy"], "")
-
-        async def test_media_paths_cannot_escape_queue(self):
-            with self.assertRaises(Permanent):
-                self.bridge.downloads.checked_path(self.cfg.root / "constants.json")
-            (self.cfg.media / "link").symlink_to(self.cfg.root / "secret")
-            with self.assertRaises(Permanent):
-                self.bridge.downloads.checked_path(self.cfg.media / "link")
-
-        async def test_private_download_host_is_blocked(self):
-            fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
-            with patch.object(socket, "getaddrinfo", return_value=fake):
-                with self.assertRaises(Permanent):
-                    await public_resolve("https://internal.example.test/file")
-
-        async def test_download_timeout_discards_partial_file(self):
-            async def fake(options, timeout, destination=None, limit=None):
-                destination.write_bytes(b"par")
-                Path(dict(options)["dump-header"]).write_text("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
-                return 28, b"", 3
-            downloads = Downloads(self.cfg, NS(run=fake, base=Curl.base))
-            path = self.cfg.media / "download.bin"
-            with patch(__name__ + ".public_resolve", new=AsyncMock(return_value=("cdn.example.test", "8.8.8.8"))):
-                with self.assertRaises(Retry):
-                    await downloads.fetch("https://cdn.example.test/file", path)
-            self.assertFalse(path.exists())
-            self.assertEqual(list(self.cfg.media.iterdir()), [])
-
-        async def test_redirect_is_revalidated(self):
-            calls = []
-            async def fake(options, timeout, destination=None, limit=None):
-                calls.append(options)
-                destination.write_bytes(b"redirect")
-                Path(dict(options)["dump-header"]).write_text("HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1/private\r\n\r\n")
-                return 0, b"", 8
-            downloads = Downloads(self.cfg, NS(run=fake, base=Curl.base))
-            resolver = AsyncMock(side_effect=[("cdn.example.test", "8.8.8.8"), Permanent("blocked")])
-            with patch(__name__ + ".public_resolve", new=resolver):
-                with self.assertRaises(Permanent):
-                    await downloads.fetch("https://cdn.example.test/file", self.cfg.media / "out.bin")
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(resolver.call_args.args[0], "https://127.0.0.1/private")
-            self.assertEqual(list(self.cfg.media.iterdir()), [])
-
-        async def test_health_does_not_hide_connection_error(self):
-            self.client.fetch_users.side_effect = ConnectionError("offline")
-            task = asyncio.create_task(self.bridge.health())
-            try:
-                for _ in range(100):
-                    if not self.bridge.max_available.is_set():
-                        break
-                    await asyncio.sleep(0.001)
-                self.assertFalse(self.bridge.max_available.is_set())
-            finally:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-        async def test_existing_route_cannot_be_stolen_by_bind(self):
-            data = {"message": self.tgmsg("/bind 200")}
-            job = await self.job("command", data)
-            with self.assertRaises(Permanent):
-                await self.bridge.execute_command(job, data)
-            route = (await self.store.read("SELECT max_id FROM tm_routes WHERE thread_id=42"))[0]
-            self.assertEqual(route["max_id"], "100")
-
-        async def test_gc_keeps_files_referenced_by_active_jobs(self):
-            path = self.cfg.media / "keep.bin"
-            path.write_bytes(b"x")
-            os.utime(path, (1, 1))
-            self.bridge.cleanup_files({path.resolve()})
-            self.assertTrue(path.exists())
-            self.bridge.cleanup_files(set())
-            self.assertFalse(path.exists())
-
-        async def test_migration_is_backed_up_and_idempotent(self):
-            await self.store.close()
-            # Use a different directory to emulate the unmodified old application.
-            root = self.cfg.root / "legacy"
-            root.mkdir()
-            cfg = dataclasses.replace(self.cfg, root=root)
-            path = root / "telegram_queue.db"
-            with sqlite3.connect(path) as c:
-                c.executescript("""
-                    CREATE TABLE topics(max_chat_id TEXT PRIMARY KEY,thread_id INTEGER,name TEXT,type TEXT);
-                    CREATE TABLE queue_v2(id INTEGER PRIMARY KEY,type TEXT,max_chat_id TEXT,thread_id INTEGER,text_data TEXT,file_data TEXT);
-                    CREATE TABLE queue_dead_letter(id INTEGER PRIMARY KEY,type TEXT,max_chat_id TEXT,thread_id INTEGER,text_data TEXT,file_data TEXT,reason TEXT);
-                    CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
-                    INSERT INTO topics VALUES('PRIVATE_100',42,'Old','private');
-                    INSERT INTO queue_v2 VALUES(1,'text','100',42,'<b>Hi</b>',NULL);
-                    INSERT INTO queue_dead_letter VALUES(2,'text','N/A',42,'DLQ text',NULL,'old error');
-                    INSERT INTO settings VALUES('status_msg_id','1234');
-                """)
-            self.store = Store(cfg)
-            rows = await self.store.read("SELECT * FROM tm_jobs ORDER BY id")
-            self.assertEqual([r["route"] for r in rows], ["100", "100"])
-            self.assertEqual([r["state"] for r in rows], ["pending", "dead"])
-            self.assertEqual(json.loads(rows[0]["payload"])["text"], "Hi")
-            self.assertEqual(await self.store.meta("status_msg_id"), "1234")
-            backups = list(root.glob("*.bak"))
-            self.assertEqual(len(backups), 1)
-            with sqlite3.connect(backups[0]) as b:
-                self.assertEqual(b.execute("SELECT COUNT(*) FROM queue_v2").fetchone()[0], 1)
-                self.assertFalse(b.execute("SELECT 1 FROM sqlite_master WHERE name='tm_jobs'").fetchone())
-            await self.store.close()
-            self.store = Store(cfg)
-            self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs")), 2)
-            self.assertEqual(len(list(root.glob("*.bak"))), 1)
-
-        async def test_database_is_bound_to_telegram_group(self):
-            with self.assertRaises(RuntimeError):
-                Store(dataclasses.replace(self.cfg, chat_id=-200))
-
-    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(UnitTests),
-                               unittest.defaultTestLoader.loadTestsFromTestCase(AsyncTests)])
-    before = logging.root.manager.disable
-    logging.disable(logging.CRITICAL)
-    try:
-        result = unittest.TextTestRunner(verbosity=1).run(suite)
-    finally:
-        logging.disable(before)
-    return 0 if result.wasSuccessful() else 1
 
 
 if __name__ == "__main__":
