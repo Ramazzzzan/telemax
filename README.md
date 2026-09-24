@@ -1,6 +1,7 @@
 
 # Telemax 3.5.2
-This is AI assisted project that can be hosted on VPS to monitor your personal MAX account and forward messages to Telegram with feedback option.
+This is AI assisted project that can be hosted on VPS to monitor your personal MAX account and forward messages to Telegram with feedback option. Based on https://github.com/MaxApiTeam/PyMax as Max API wrapper. 
+
 Telemax 3.5.2 — крупное обновление надёжности MAX ↔ Telegram bridge с упором на сохранность сообщений, работу с вложениями, диагностику ошибок и эксплуатацию в production.
 
 Версия сохраняет существующие Telegram topics и MAX session при корректном обновлении, добавляет новые административные команды и улучшает обработку ошибок и очередей.
