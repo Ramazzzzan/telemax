@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.2 — MAX <-> Telegram bridge.
+"""Telemax 3.5.3 — MAX <-> Telegram bridge.
 
 Python 3.10+; maxapi-python==2.4.1; curl; Linux.
 Configure constants.json, run --init once, then start normally.
@@ -51,13 +51,22 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-VERSION = "3.5.2"
+VERSION = "3.5.3"
 SCHEMA_VERSION = "351"  # Storage format, not application release number.
 UPGRADE_SCHEMAS = {"3", "350"}
 SDK_VERSION = "2.4.1"
 LOG = logging.getLogger("telemax")
 ACTIVE = ("pending", "running", "dead", "uncertain")
 MEDIA_TYPES = {"PHOTO", "VIDEO", "FILE", "AUDIO", "VOICE", "STICKER"}
+PYMAX_PYPI_URL = "https://pypi.org/pypi/maxapi-python/json"
+PYMAX_COMPARE_URL = "https://api.github.com/repos/MaxApiTeam/PyMax/compare/v{old}...v{new}"
+PYMAX_IMPORTANT_GROUPS = {
+    "security": ("security", "vulnerab", "cve-", "credential", "token leak"),
+    "authentication/session": ("authentication", "authorization", "login", "session", "2fa", "handshake"),
+    "protocol/connectivity": ("protocol", "transport", "reconnect", "connection manager", "tcp", "websocket"),
+    "delivery/data integrity": ("data loss", "message loss", "send_message", "message delivery", "upload", "attachment"),
+    "compatibility": ("breaking", "incompatible", "compatibility", "migration required"),
+}
 
 
 class Retry(Exception):
@@ -159,12 +168,39 @@ def user_name(user: Any, fallback: str) -> str:
     return str(name or (get(names[0], "name") if names else None) or get(user, "name") or fallback)
 
 
+def semver(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", str(value or "").strip())
+    return tuple(map(int, match.groups())) if match else None
+
+
+def classify_pymax_update(installed: str, latest: str, evidence: str = "") -> tuple[bool, list[str]]:
+    """Conservative importance classifier: presence != recommendation to upgrade."""
+    current, offered = semver(installed), semver(latest)
+    if not current or not offered or offered <= current:
+        return False, []
+    reasons: list[str] = []
+    if offered[0] > current[0]:
+        reasons.append("новая major-версия")
+    haystack = evidence.lower()
+    for label, needles in PYMAX_IMPORTANT_GROUPS.items():
+        if any(needle in haystack for needle in needles):
+            reasons.append(label)
+    # A normal minor/patch release without strong evidence is visible in /status,
+    # but intentionally does not generate an alert.
+    return bool(reasons), list(dict.fromkeys(reasons))
+
+
 def control_text(attachment: dict) -> str:
     # ControlAttachment in maxapi-python 2.4.1 has event and optional title.
-    # Unknown event codes are displayed literally, never guessed or downloaded.
-    event = str(attachment.get("event") or "CONTROL")
+    # Only codes observed/explicitly requested are translated; unknown codes stay literal.
+    event = str(attachment.get("event") or "CONTROL").strip()
     title = str(attachment.get("title") or "").strip()
-    return f"[Событие MAX: {event}]" + (f" {title}" if title else "")
+    labels = {
+        "add": "Добавление пользователя в группу",
+    }
+    label = labels.get(event.lower())
+    text = label if label else f"[Событие MAX: {event}]"
+    return text + (f" {title}" if title else "")
 
 
 def attachment_text(attachment: dict) -> str:
@@ -339,6 +375,8 @@ class Config:
     dedup_max_keys: int = 200000
     media_ipv4_only: bool = True
     blocked_ipv6_prefixes: tuple[str, ...] = ()
+    pymax_update_check: bool = True
+    pymax_update_hours: int = 24
 
     KEYS = frozenset({
         "MAX_PHONE", "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_ALLOWED_USER_IDS",
@@ -347,7 +385,7 @@ class Config:
         "HISTORY_DAYS", "MAX_ATTEMPTS", "ERROR_DUMP_LIMIT_MB",
         "INBOX_LIMIT_MB", "WORKERS", "DOWNLOAD_WORKERS", "RETRY_WINDOW_SECONDS",
         "HISTORY_MAX_JOBS", "DEDUP_DAYS", "DEDUP_MAX_KEYS", "MEDIA_IPV4_ONLY",
-        "BLOCKED_IPV6_PREFIXES",
+        "BLOCKED_IPV6_PREFIXES", "PYMAX_UPDATE_CHECK", "PYMAX_UPDATE_CHECK_HOURS",
     })
 
     @property
@@ -423,6 +461,9 @@ class Config:
         ipv4_only = data.get("MEDIA_IPV4_ONLY", True)
         if not isinstance(ipv4_only, bool):
             raise ValueError("MEDIA_IPV4_ONLY must be true or false")
+        update_check = data.get("PYMAX_UPDATE_CHECK", True)
+        if not isinstance(update_check, bool):
+            raise ValueError("PYMAX_UPDATE_CHECK must be true or false")
         networks = data.get("BLOCKED_IPV6_PREFIXES", [])
         if not isinstance(networks, list) or not all(isinstance(n, str) for n in networks):
             raise ValueError("BLOCKED_IPV6_PREFIXES must be a JSON array of IPv6 CIDRs")
@@ -441,7 +482,7 @@ class Config:
                    positive("INBOX_LIMIT_MB", 512) * 1024**2, workers, downloads,
                    positive("RETRY_WINDOW_SECONDS", 86400), positive("HISTORY_MAX_JOBS", 10000),
                    positive("DEDUP_DAYS", 90), positive("DEDUP_MAX_KEYS", 200000),
-                   ipv4_only, networks)
+                   ipv4_only, networks, update_check, positive("PYMAX_UPDATE_CHECK_HOURS", 24))
 
     def authorized(self, msg: dict, *, admin: bool = False) -> bool:
         sender = msg.get("from") or {}
@@ -1553,9 +1594,11 @@ class Inbox:
 
 
 class Bridge:
-    def __init__(self, cfg: Config, store: Store, client: Any, media_classes: dict[str, Any]):
+    def __init__(self, cfg: Config, store: Store, client: Any, media_classes: dict[str, Any],
+                 upload_error_cls: type[Exception] | tuple = ()):
         self.cfg, self.store, self.client = cfg, store, client
         self.media_classes = media_classes
+        self.upload_error_cls = upload_error_cls
         self.curl = Curl()
         self.tg = Telegram(cfg, store, self.curl)
         self.downloads = Downloads(cfg, self.curl)
@@ -1566,6 +1609,8 @@ class Bridge:
         self.own_id = cfg.my_max_id
         self.topic_lock = asyncio.Lock()
         self.diagnostic_lock = asyncio.Lock()
+        self.status_lock = asyncio.Lock()
+        self.status_pin_checked_id: int | None = None
         self.started = time.time()
 
     def abort(self, exc: BaseException):
@@ -1714,7 +1759,9 @@ class Bridge:
         header = f"[{name}]:" if chat_type == "private" else f"[{title}], [{name}]:"
         text = data.get("text") or ""
         if data.get("action"):
-            text = f"[Событие: {data['action']}]\n{text}".strip()
+            action = str(data["action"])
+            label = "Добавление пользователя в группу" if action.lower() == "add" else f"[Событие: {action}]"
+            text = f"{label}\n{text}".strip()
         files = list(data.get("files") or [])
         forward = data.get("forward")
         while forward:
@@ -1723,7 +1770,9 @@ class Bridge:
             files.extend(forward.get("files") or [])
             forward = forward.get("forward")
         if not text and not files:
-            text = f"[Событие MAX: {data.get('type') or 'UNKNOWN'}]"
+            event_type = str(data.get("type") or "UNKNOWN")
+            text = ("Добавление пользователя в группу" if event_type.lower() == "add"
+                    else f"[Событие MAX: {event_type}]")
         normalized = []
         for original in files:
             if not isinstance(original, dict):
@@ -1954,30 +2003,57 @@ class Bridge:
         if not self.max_available.is_set():
             raise Retry("MAX connection unavailable", 30, count=False)
         paths = await self.materialize(job, data)
-        attachments = []
-        for f, path in zip(data.get("files") or [], paths):
-            typ = f.get("kind", "document")
-            if typ == "voice" and path.suffix.lower() != ".ogg":
-                typ = "document"  # Do not relabel or pretend to transcode MP3/OPUS.
-            klass = self.media_classes[typ if typ in self.media_classes else "document"]
-            kwargs = {"path": str(path)}
-            if typ == "video_note":
-                kwargs["duration"] = int(f.get("duration") or 1) * 1000
-            attachments.append(klass(**kwargs))
+
+        def build_attachments(*, photo_as_file=False):
+            attachments = []
+            for f, path in zip(data.get("files") or [], paths):
+                typ = f.get("kind", "document")
+                if typ == "voice" and path.suffix.lower() != ".ogg":
+                    typ = "document"  # Do not relabel or pretend to transcode MP3/OPUS.
+                if typ == "photo" and photo_as_file:
+                    typ = "document"
+                klass = self.media_classes[typ if typ in self.media_classes else "document"]
+                kwargs = {"path": str(path)}
+                if typ == "video_note":
+                    kwargs["duration"] = int(f.get("duration") or 1) * 1000
+                attachments.append(klass(**kwargs))
+            return attachments
+
+        has_photo = any(f.get("kind") == "photo" for f in data.get("files") or [])
+        attachments = build_attachments()
+        photo_fallback = False
         await self.store.phase(job, "send")
         try:
             response = await asyncio.wait_for(self.client.send_message(
                 chat_id=int(job["route"]), text=data.get("text") or "",
                 attachments=attachments or None), 300)
         except Exception as exc:
-            # SDK can upload and send before raising; never blindly try other methods.
-            raise Uncertain(f"MAX send result unknown ({type(exc).__name__}); check before forced retry") from exc
+            # In pinned PyMax 2.4.1 UploadError is raised while attachments are uploaded,
+            # before the MSG_SEND frame. Therefore this specific error is definitely unsent.
+            if self.upload_error_cls and isinstance(exc, self.upload_error_cls):
+                if has_photo:
+                    LOG.warning("Native MAX photo upload failed for job %s; retrying image as File", job["id"])
+                    photo_fallback = True
+                    try:
+                        response = await asyncio.wait_for(self.client.send_message(
+                            chat_id=int(job["route"]), text=data.get("text") or "",
+                            attachments=build_attachments(photo_as_file=True) or None), 300)
+                    except Exception as retry_exc:
+                        if self.upload_error_cls and isinstance(retry_exc, self.upload_error_cls):
+                            raise Retry("MAX attachment upload failed before message send", 30) from retry_exc
+                        raise Uncertain(
+                            f"MAX send result unknown ({type(retry_exc).__name__}); check before forced retry") from retry_exc
+                else:
+                    raise Retry("MAX attachment upload failed before message send", 30) from exc
+            else:
+                # Other SDK failures can happen after the message frame was sent.
+                raise Uncertain(f"MAX send result unknown ({type(exc).__name__}); check before forced retry") from exc
         mid = get(response, "id")
         if mid is None:
             raise Uncertain("MAX returned no message ID")
 
         def finish(c):
-            self.store.finish_in_tx(c, job, {"id": str(mid)})
+            self.store.finish_in_tx(c, job, {"id": str(mid), "photo_file_fallback": photo_fallback})
             parent = origin.get("parent")
             if parent:
                 remaining = c.execute("SELECT COUNT(*) FROM tm_jobs WHERE kind='to_max' AND key LIKE ? AND state!='done'", (parent + "/%",)).fetchone()[0]
@@ -2334,6 +2410,145 @@ class Bridge:
         if command == "/retry_dlq" and arg and not re.fullmatch(r"[1-9]\d*(?: force)?", arg):
             raise Permanent("Использование: /retry_dlq [ID] или /retry_dlq ID force")
 
+    async def external_json(self, url: str, *, limit=2 * 1024 * 1024) -> Any:
+        opts = self.curl.base(url, 30, self.cfg.proxy)
+        opts.extend([("header", "Accept: application/json"),
+                     ("header", f"User-Agent: Telemax/{VERSION}")])
+        code, body, _ = await self.curl.run(opts, 30, limit=limit)
+        if code:
+            raise OSError(f"HTTP fetch failed (curl {code})")
+        try:
+            return json.loads(body)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid update-check JSON") from exc
+
+    async def check_pymax_update(self) -> dict:
+        now = time.time()
+        previous = payload_object(await self.store.meta("pymax_update_state", "{}"))
+        try:
+            pypi = await self.external_json(PYMAX_PYPI_URL)
+            latest = str(get(get(pypi, "info", {}), "version") or "").strip()
+            if semver(latest) is None:
+                raise ValueError("PyPI returned invalid maxapi-python version")
+            evidence, compare_ok = "", False
+            current_v, latest_v = semver(SDK_VERSION), semver(latest)
+            if current_v and latest_v and latest_v > current_v:
+                try:
+                    comparison = await self.external_json(
+                        PYMAX_COMPARE_URL.format(old=SDK_VERSION, new=latest), limit=4 * 1024 * 1024)
+                    commits = comparison.get("commits") if isinstance(comparison, dict) else []
+                    if isinstance(commits, list):
+                        evidence = "\n".join(str(get(get(c, "commit", {}), "message") or "") for c in commits)
+                        compare_ok = True
+                except (OSError, ValueError, asyncio.TimeoutError):
+                    # Version discovery remains valid. Lack of GitHub evidence must not
+                    # turn an ordinary minor release into an alarm.
+                    compare_ok = False
+            important, reasons = classify_pymax_update(SDK_VERSION, latest, evidence)
+            state = {"installed": SDK_VERSION, "latest": latest, "important": important,
+                     "reasons": reasons, "checked_at": now, "compare_ok": compare_ok, "error": ""}
+            await self.store.set_meta("pymax_update_state", jdump(state))
+            if important and latest != await self.store.meta("pymax_update_alerted_version"):
+                reason = ", ".join(reasons) or "важное изменение"
+                text = (f"⚠️ Важное обновление PyMax: {SDK_VERSION} → {latest}\n"
+                        f"Причина классификации: {reason}.\n"
+                        "Telemax не обновляет библиотеку автоматически; сначала проверьте совместимость.")
+                await self.store.add(f"pymax-update:{latest}", "notice", "notice:None",
+                                     {"text": text, "thread": None})
+                await self.push(text)
+                await self.store.set_meta("pymax_update_alerted_version", latest)
+            return state
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
+            state = dict(previous) if isinstance(previous, dict) else {}
+            state.update({"installed": SDK_VERSION, "attempted_at": now,
+                          "error": type(exc).__name__})
+            await self.store.set_meta("pymax_update_state", jdump(state))
+            LOG.warning("PyMax update check failed (%s)", type(exc).__name__)
+            return state
+
+    async def update_monitor(self):
+        if not self.cfg.pymax_update_check:
+            await self.stop.wait()
+            return
+        interval = self.cfg.pymax_update_hours * 3600
+        while not self.stop.is_set():
+            state = payload_object(await self.store.meta("pymax_update_state", "{}"))
+            stamp = float(state.get("checked_at") or state.get("attempted_at") or 0)
+            # Successful checks are daily; a failed network check may retry after one hour.
+            wait_for = interval if state.get("checked_at") else min(interval, 3600)
+            remaining = max(0.0, wait_for - (time.time() - stamp)) if stamp else 0.0
+            if remaining:
+                try:
+                    await asyncio.wait_for(self.stop.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            try:
+                await self.check_pymax_update()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Update monitoring is informational and must never stop the bridge.
+                LOG.warning("PyMax update monitor deferred (%s)", type(exc).__name__)
+                try:
+                    await asyncio.wait_for(self.stop.wait(), timeout=min(interval, 3600))
+                except asyncio.TimeoutError:
+                    pass
+
+    async def refresh_status_message(self) -> bool:
+        """Create/adopt, update and pin one General status message."""
+        async with self.status_lock:
+            text = await self.status_text()
+            message_id = number(await self.store.meta("status_msg_id"))
+            bot_id = number(self.cfg.token.split(":", 1)[0])
+
+            if message_id is None:
+                # Recover an existing Telemax pinned message if metadata was lost.
+                chat_response = await self.tg.call("getChat", {"chat_id": self.cfg.chat_id}, timeout=20)
+                if chat_response.ok:
+                    pinned = get(chat_response.result, "pinned_message")
+                    pinned_from = get(pinned, "from", {})
+                    pinned_text = str(get(pinned, "text") or "")
+                    if (number(get(pinned, "message_id")) and number(get(pinned_from, "id")) == bot_id
+                            and pinned_text.startswith("Telemax ")):
+                        message_id = number(get(pinned, "message_id"))
+                        await self.store.set_meta("status_msg_id", message_id)
+
+            if message_id is not None:
+                response = await self.tg.call("editMessageText", {
+                    "chat_id": self.cfg.chat_id, "message_id": message_id, "text": text}, timeout=30)
+                if not response.ok:
+                    lower = response.error.lower()
+                    if response.code == 400 and "message is not modified" in lower:
+                        pass
+                    elif response.code == 400 and any(x in lower for x in
+                            ("message to edit not found", "message not found", "message_id_invalid")):
+                        await self.store.set_meta("status_msg_id", "")
+                        message_id = None
+                        self.status_pin_checked_id = None
+                    else:
+                        require_api(response)
+
+            if message_id is None:
+                response = await self.tg.call("sendMessage", {
+                    "chat_id": self.cfg.chat_id, "text": text, "disable_notification": True}, timeout=30)
+                result = require_api(response, sending=True)
+                message_id = number(get(result, "message_id"))
+                if message_id is None:
+                    raise Uncertain("Status message created without message_id")
+                await self.store.set_meta("status_msg_id", message_id)
+
+            if self.status_pin_checked_id != message_id:
+                response = await self.tg.call("pinChatMessage", {
+                    "chat_id": self.cfg.chat_id, "message_id": message_id,
+                    "disable_notification": True}, timeout=30)
+                if response.ok or (response.code == 400 and "already" in response.error.lower()):
+                    self.status_pin_checked_id = message_id
+                else:
+                    require_api(response)
+            await self.store.set_meta("status_updated", time.time())
+            return True
+
     async def status_text(self) -> str:
         rows = await self.store.read("SELECT kind,state,COUNT(*) n FROM tm_jobs WHERE state IN ('pending','running','dead','uncertain') GROUP BY kind,state")
         lines = [f"Telemax {VERSION}", "MAX: " + ("последняя проверка успешна" if self.max_available.is_set() else "соединение не подтверждено")]
@@ -2342,6 +2557,23 @@ class Bridge:
                            ("max_delivered", "Доставлено в MAX")):
             stamp = await self.store.meta(key)
             lines.append(f"{title}: " + (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(stamp))) if stamp else "ещё не было"))
+        update = payload_object(await self.store.meta("pymax_update_state", "{}"))
+        if not self.cfg.pymax_update_check:
+            lines.append(f"PyMax SDK: {SDK_VERSION}; проверка обновлений отключена")
+        elif update.get("latest"):
+            latest = str(update.get("latest"))
+            if latest == SDK_VERSION:
+                lines.append(f"PyMax SDK: {SDK_VERSION} (актуальная)")
+            elif update.get("important"):
+                reason = ", ".join(update.get("reasons") or []) or "важное изменение"
+                lines.append(f"PyMax SDK: {SDK_VERSION}; ⚠ важное обновление {latest}: {reason}")
+            else:
+                lines.append(f"PyMax SDK: {SDK_VERSION}; доступна {latest}, важных сигналов не обнаружено")
+            checked = update.get("checked_at")
+            if checked:
+                lines.append("Проверка PyMax: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(checked))))
+        else:
+            lines.append(f"PyMax SDK: {SDK_VERSION}; обновления ещё не проверялись")
         lines.append(f"Inbox: {self.inbox.usage // 1024} KiB; неперсистентных callback: {self.inbox.waiting}")
         if self.inbox.last_error or self.store.db_error:
             lines.append("ВНИМАНИЕ: хранилище недоступно, проверьте диск/права; см. журнал.")
@@ -2414,9 +2646,20 @@ class Bridge:
                 raise
             except Suppressed:
                 pass
-            except (Retry, Permanent, Uncertain) as exc:
+            except Permanent as exc:
+                if job_kind == "command":
+                    # Invalid command arguments / unavailable targets are user-facing errors,
+                    # not delivery failures. Reply in the originating topic and close the job.
+                    payload = payload_object(job.get("payload") or "{}")
+                    thread = (payload.get("message") or {}).get("message_thread_id")
+                    await self.store.expand(job, self.notice_specs(f"❌ {str(exc)[:1000]}", thread))
+                else:
+                    await self.store.fail(job, exc)
+                    await self.report_error(job)
+            except (Retry, Uncertain) as exc:
                 await self.store.fail(job, exc)
-                await self.report_error(job)
+                if isinstance(exc, Uncertain):
+                    await self.report_error(job)
             except Exception as exc:
                 LOG.exception("Unexpected failure in job %s", job["id"])
                 cls = Uncertain if job.get("phase") == "send" else Permanent
@@ -2483,9 +2726,18 @@ class Bridge:
             await asyncio.sleep(interval)
 
     async def maintenance(self):
-        last_alert = 0.0
+        next_status = 0.0
         while not self.stop.is_set():
             try:
+                now = time.time()
+                if now >= next_status:
+                    try:
+                        await self.refresh_status_message()
+                        next_status = now + 900  # pinned General status refresh every 15 minutes
+                    except (Retry, Permanent, Uncertain, OSError, ValueError) as exc:
+                        LOG.warning("General status refresh deferred (%s)", type(exc).__name__)
+                        next_status = now + 60
+
                 # Also handles failures recovered as uncertain at process startup and
                 # old 3.5.0 DLQ rows. At most 20 unsnapshotted failures per maintenance tick.
                 failures = await self.store.read("SELECT j.*,m.value AS diagnostic_metadata FROM tm_jobs j LEFT JOIN tm_meta m "
@@ -2508,11 +2760,10 @@ class Bridge:
                         used.add(self.downloads.checked_path(path))
                 await asyncio.to_thread(self.cleanup_files, used)
                 await asyncio.to_thread(self.cleanup_error_dumps, {r['id'] for r in rows})
-                counts = await self.store.read("SELECT COUNT(*) n FROM tm_jobs WHERE state IN ('dead','uncertain')")
-                if counts[0]["n"] and time.time() - last_alert > 1800:
-                    LOG.warning("DLQ contains %s jobs; inspect /dlq", counts[0]["n"])
-                    await self.push(f"Telemax: {counts[0]['n']} jobs need attention. Use /dlq.")
-                    last_alert = time.time()
+
+                count = (await self.store.read(
+                    "SELECT COUNT(*) n FROM tm_jobs WHERE state IN ('dead','uncertain')"))[0]["n"]
+                await self.notify_dlq_count(count)
             except (sqlite3.Error, OSError, ValueError) as exc:
                 LOG.error("Maintenance deferred (%s); no unprocessed messages discarded", type(exc).__name__)
             await asyncio.sleep(60)
@@ -2526,9 +2777,25 @@ class Bridge:
             if path.resolve() not in used and path.stat().st_mtime < cutoff:
                 path.unlink(missing_ok=True)
 
-    async def push(self, text: str):
+    async def notify_dlq_count(self, count: int):
         if not self.cfg.ntfy:
             return
+        saved = await self.store.meta("ntfy_dlq_count", "")
+        previous_count = number(saved) if saved != "" else None
+        if previous_count is None and count == 0:
+            await self.store.set_meta("ntfy_dlq_count", 0)
+            return
+        if previous_count == count:
+            return
+        LOG.warning("DLQ count changed: %s -> %s", previous_count, count)
+        alert = (f"Telemax: {count} jobs need attention. Use /dlq." if count
+                 else "Telemax: DLQ cleared.")
+        if await self.push(alert):
+            await self.store.set_meta("ntfy_dlq_count", count)
+
+    async def push(self, text: str) -> bool:
+        if not self.cfg.ntfy:
+            return False
         try:
             opts = self.curl.base(self.cfg.ntfy, 10, None)
             opts.extend([("proto", "=https,http"), ("header", "Title: Telemax"), ("data-binary", text)])
@@ -2536,8 +2803,11 @@ class Bridge:
             code, _, _ = await self.curl.run(opts, 10, limit=1024 * 1024)
             if code:
                 LOG.warning("NTFY alert rejected or unreachable (curl %s)", code)
+                return False
+            return True
         except Exception:
             LOG.warning("NTFY alert could not be sent")
+            return False
 
     async def run(self):
         self.client.on_start()(self.on_start)
@@ -2547,6 +2817,7 @@ class Bridge:
             loop.add_signal_handler(sig, self.stop.set)
         coros = {"max-client": self.client.start(), "tg-poll": self.polling(),
                  "health": self.health(), "watchdog": self.watchdog(), "maintenance": self.maintenance(),
+                 "update-monitor": self.update_monitor(),
                  "inbox": self.inbox_worker(), "storage-health": self.storage_health()}
         for name in ("max_in", "tg_in", "to_tg", "to_max", "command", "notice", "reaction", "edit_topic", "edit_status"):
             count = self.cfg.workers if name in {"max_in", "to_tg", "to_max"} else 1
@@ -2609,15 +2880,15 @@ def load_sdk():
         raise RuntimeError(f"Install maxapi-python=={SDK_VERSION} in the service venv") from exc
     if installed != SDK_VERSION:
         raise RuntimeError(f"Expected maxapi-python=={SDK_VERSION}; installed: {installed}")
-    from pymax import Client, File, Photo, Video, VideoNote, Voice
+    from pymax import Client, File, Photo, UploadError, Video, VideoNote, Voice
     from pymax.config import ExtraConfig
     return Client, ExtraConfig, {"document": File, "photo": Photo, "video": Video,
-                                "voice": Voice, "video_note": VideoNote}
+                                "voice": Voice, "video_note": VideoNote}, UploadError
 
 
-async def serve(cfg: Config, client, classes):
+async def serve(cfg: Config, client, classes, upload_error_cls=()):
     store = Store(cfg)
-    bridge = Bridge(cfg, store, client, classes)
+    bridge = Bridge(cfg, store, client, classes, upload_error_cls)
     try:
         await bridge.run()
     except Exception as exc:
@@ -2690,7 +2961,7 @@ def main():
         return 0
     if not shutil.which("curl"):
         raise RuntimeError("curl executable is required")
-    Client, ExtraConfig, classes = load_sdk()
+    Client, ExtraConfig, classes, upload_error_cls = load_sdk()
     if args.check_config or args.check:
         if args.check:
             Store.check(cfg)
@@ -2715,7 +2986,7 @@ def main():
         LOG.info("Starting Telemax %s", VERSION)
         if not cfg.allowed and not cfg.admins:
             LOG.warning("Telegram → MAX and all commands disabled: no authorized user IDs")
-        asyncio.run(serve(cfg, client, classes))
+        asyncio.run(serve(cfg, client, classes, upload_error_cls))
     return 0
 
 

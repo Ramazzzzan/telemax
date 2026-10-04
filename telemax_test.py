@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.2 regression tests. Run: python -m unittest -v telemax_test.
+"""Telemax 3.5.3 regression tests. Run: python -m unittest -v telemax_test.
 
 The core suite uses temporary SQLite databases, mocked external APIs and loopback
 HTTP only. No MAX or Telegram credentials are read. Optional SDK contract tests
@@ -517,7 +517,7 @@ class FreshStateTests(unittest.TestCase):
         with sqlite_connection(self.root / "telegram_queue.db") as conn:
             meta = dict(conn.execute("SELECT key,value FROM tm_meta"))
             self.assertEqual(meta["schema"], app.SCHEMA_VERSION)
-            self.assertEqual(meta["created_by"], "3.5.2")
+            self.assertEqual(meta["created_by"], "3.5.3")
             self.assertEqual(meta["tg_bot_id"], "123")
             self.assertEqual(meta["tg_chat_id"], "-100")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tm_jobs").fetchone()[0], 0)
@@ -635,7 +635,7 @@ class FreshStateTests(unittest.TestCase):
                                 cwd=self.root, env={**os.environ, "PYTHONPATH": str(Path(app.__file__).parent)},
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "3.5.2")
+        self.assertEqual(result.stdout.strip(), "3.5.3")
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_cli_init_is_offline_and_repeated_init_fails(self):
@@ -655,7 +655,7 @@ class FreshStateTests(unittest.TestCase):
         result = subprocess.run([sys.executable, app.__file__, "--version"], cwd=self.root,
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "Telemax 3.5.2")
+        self.assertEqual(result.stdout.strip(), "Telemax 3.5.3")
 
 
 class Config350Tests(unittest.TestCase):
@@ -2181,6 +2181,152 @@ class Additional352Tests(BridgeFixture):
         await self.bridge.report_error(child)
         diagnostic = json.loads((self.cfg.errors/f"job-{child['id']}.json").read_text())
         self.assertEqual(diagnostic['original_message'], message)
+
+
+class Release353UnitTests(unittest.TestCase):
+    def test_control_add_has_human_label(self):
+        self.assertEqual(app.control_text({"event": "add"}), "Добавление пользователя в группу")
+        self.assertEqual(app.control_text({"event": "ADD", "title": "Иван"}),
+                         "Добавление пользователя в группу Иван")
+
+    def test_pymax_minor_without_important_evidence_does_not_alert(self):
+        important, reasons = app.classify_pymax_update("2.4.1", "2.5.0", "docs and typing cleanup")
+        self.assertFalse(important)
+        self.assertEqual(reasons, [])
+
+    def test_pymax_security_or_major_change_is_important(self):
+        important, reasons = app.classify_pymax_update(
+            "2.4.1", "2.5.0", "Fix authentication session reconnect security issue")
+        self.assertTrue(important)
+        self.assertIn("security", reasons)
+        self.assertIn("authentication/session", reasons)
+        major, major_reasons = app.classify_pymax_update("2.4.1", "3.0.0", "")
+        self.assertTrue(major)
+        self.assertIn("новая major-версия", major_reasons)
+
+
+class Release353Tests(BridgeFixture):
+    async def test_top_level_add_event_is_human_readable(self):
+        data = {"id": 701, "chat_id": 100, "sender": 2, "text": "", "type": "add",
+                "time": int(time.time() * 1000), "files": []}
+        job = await self.job("max_in", data, key="max:100:701")
+        await self.bridge.prepare_max(job, data)
+        child = await self.store.claim("to_tg")
+        payload = json.loads(child["payload"])
+        self.assertIn("Добавление пользователя в группу", payload["text"])
+        self.assertNotIn("[Событие MAX: add]", payload["text"])
+
+    async def test_command_validation_error_is_reply_not_dlq(self):
+        data = {"message": self.tgmsg("/clear_dlq@test_bot")}
+        await self.store.add("cmd-clear", "command", "thread:42", data)
+        task = asyncio.create_task(self.bridge.worker("command"))
+        try:
+            async def wait_done():
+                while True:
+                    row = (await self.store.read("SELECT state FROM tm_jobs WHERE key='cmd-clear'"))[0]
+                    if row["state"] == "done":
+                        return
+                    await asyncio.sleep(0.001)
+            await asyncio.wait_for(wait_done(), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        row = (await self.store.read("SELECT state FROM tm_jobs WHERE key='cmd-clear'"))[0]
+        self.assertEqual(row["state"], "done")
+        self.assertFalse(await self.store.read(
+            "SELECT 1 FROM tm_jobs WHERE key='cmd-clear' AND state IN ('dead','uncertain')"))
+        notices = await self.store.read("SELECT payload FROM tm_jobs WHERE kind='notice' ORDER BY id")
+        self.assertTrue(any("/clear_dlq confirm" in json.loads(r["payload"])["text"] for r in notices))
+        self.assertFalse(await self.store.meta("diagnostic:" + str((await self.store.read(
+            "SELECT id FROM tm_jobs WHERE key='cmd-clear'"))[0]["id"])))
+
+    async def test_general_status_is_created_pinned_and_then_edited(self):
+        self.bridge.tg.call = AsyncMock(side_effect=[
+            ApiResult(ok=True, result={}),
+            ApiResult(ok=True, result={"message_id": 99}),
+            ApiResult(ok=True, result=True),
+        ])
+        self.assertTrue(await self.bridge.refresh_status_message())
+        self.assertEqual(await self.store.meta("status_msg_id"), "99")
+        methods = [c.args[0] for c in self.bridge.tg.call.call_args_list]
+        self.assertEqual(methods, ["getChat", "sendMessage", "pinChatMessage"])
+        send_params = self.bridge.tg.call.call_args_list[1].args[1]
+        self.assertNotIn("message_thread_id", send_params)
+
+        self.bridge.tg.call = AsyncMock(return_value=ApiResult(ok=True, result={"message_id": 99}))
+        await self.bridge.refresh_status_message()
+        self.bridge.tg.call.assert_awaited_once()
+        self.assertEqual(self.bridge.tg.call.call_args.args[0], "editMessageText")
+
+    async def test_telegram_photo_upload_error_falls_back_to_file(self):
+        class FakeUploadError(Exception):
+            pass
+        class PhotoAttachment(Attachment):
+            pass
+        class FileAttachment(Attachment):
+            pass
+
+        self.bridge.upload_error_cls = FakeUploadError
+        self.bridge.media_classes["photo"] = PhotoAttachment
+        self.bridge.media_classes["document"] = FileAttachment
+        path = self.cfg.media / "telegram-photo.jpg"
+        path.write_bytes(b"jpeg")
+        data = {"text": "caption", "files": [{"source": "telegram", "kind": "photo",
+                "path": str(path), "name": "telegram-photo.jpg"}],
+                "origin": {"sender": 7, "parent": "tg:photo", "message_id": 77}}
+        job = await self.job("to_max", data, key="tg:photo/0")
+        self.client.send_message.side_effect = [FakeUploadError("native photo upload failed"), NS(id=901)]
+        await self.bridge.send_max(job, data)
+        self.assertEqual(self.client.send_message.await_count, 2)
+        first = self.client.send_message.await_args_list[0].kwargs["attachments"][0]
+        second = self.client.send_message.await_args_list[1].kwargs["attachments"][0]
+        self.assertIsInstance(first, PhotoAttachment)
+        self.assertIsInstance(second, FileAttachment)
+        state = await self.state(job)
+        self.assertEqual(state["state"], "done")
+        self.assertTrue(json.loads(state["result"])["photo_file_fallback"])
+
+    async def test_non_photo_upload_error_is_retryable_not_uncertain(self):
+        class FakeUploadError(Exception):
+            pass
+        self.bridge.upload_error_cls = FakeUploadError
+        path = self.cfg.media / "doc.pdf"
+        path.write_bytes(b"pdf")
+        data = {"text": "", "files": [{"source": "telegram", "kind": "document",
+                "path": str(path), "name": "doc.pdf"}], "origin": {"sender": 7}}
+        job = await self.job("to_max", data, key="tg:doc/0")
+        self.client.send_message.side_effect = FakeUploadError("upload failed")
+        with self.assertRaises(Retry):
+            await self.bridge.send_max(job, data)
+
+    async def test_pymax_important_update_alert_is_once_per_version(self):
+        self.bridge.external_json = AsyncMock(side_effect=[
+            {"info": {"version": "2.5.0"}},
+            {"commits": [{"commit": {"message": "Security fix for authentication handshake"}}]},
+        ])
+        self.bridge.push = AsyncMock(return_value=True)
+        state = await self.bridge.check_pymax_update()
+        self.assertTrue(state["important"])
+        self.assertEqual(state["latest"], "2.5.0")
+        self.assertEqual(await self.store.meta("pymax_update_alerted_version"), "2.5.0")
+        notices = await self.store.read("SELECT * FROM tm_jobs WHERE key='pymax-update:2.5.0'")
+        self.assertEqual(len(notices), 1)
+        self.bridge.push.assert_awaited_once()
+
+    async def test_ntfy_dlq_alert_only_when_count_changes(self):
+        self.bridge.cfg = dataclasses.replace(self.cfg, ntfy="https://ntfy.example/topic")
+        self.bridge.push = AsyncMock(return_value=True)
+        await self.bridge.notify_dlq_count(1)
+        await self.bridge.notify_dlq_count(1)
+        await self.bridge.notify_dlq_count(2)
+        await self.bridge.notify_dlq_count(0)
+        self.assertEqual(self.bridge.push.await_count, 3)
+        texts = [c.args[0] for c in self.bridge.push.await_args_list]
+        self.assertIn("1 jobs", texts[0])
+        self.assertIn("2 jobs", texts[1])
+        self.assertEqual(texts[2], "Telemax: DLQ cleared.")
+        self.assertEqual(await self.store.meta("ntfy_dlq_count"), "0")
+
 
 
 class Config352Tests(unittest.TestCase):

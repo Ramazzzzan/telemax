@@ -1,11 +1,34 @@
-# Telemax 3.5.2 — установка и обновление
+# Telemax 3.5.3 — установка и обновление
 
 Комплект: `telemax.py`, `telemax_test.py`, этот `deployment.md`. Python 3.10+,
 Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запуске не устанавливаются.
-Версия приложения **3.5.2**, формат БД **351** — разные номера: формат не меняется
+Версия приложения **3.5.3**, формат БД **351** — разные номера: формат не меняется
 просто из-за нового номера релиза.
 
-## Обновление работающей установки: БД не удалять
+## Быстрое обновление с 3.5.2
+
+Формат БД в 3.5.3 остаётся **351**, поэтому для уже работающей 3.5.2 миграция не нужна.
+Остановите сервис, сделайте backup `telemax.py` и SQLite, замените `telemax.py` и
+`telemax_test.py`, выполните `--check`/тесты и запустите сервис. `constants.json`
+можно оставить без изменений: новые ключи update-check необязательны и имеют defaults.
+
+```bash
+cd /home/htpc/telemax
+sudo systemctl stop telemax.service
+cp -p telemax.py "telemax.py.pre-3.5.3.$(date +%Y%m%d-%H%M%S)"
+sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.3.bak'"
+cp /path/to/release/telemax.py /path/to/release/telemax_test.py .
+./venv/bin/python telemax.py --check
+./venv/bin/python -m unittest -v telemax_test
+sudo systemctl start telemax.service
+sudo journalctl -u telemax.service -n 80 --no-pager
+```
+
+Существующая MAX-сессия, топики, mute, очередь и DLQ сохраняются. Старые command-ошибки,
+уже попавшие в DLQ до обновления, автоматически не удаляются. Их можно отменить после
+проверки новой версии.
+
+## Обновление более старой установки: БД не удалять
 
 Эта инструкция **заменяет прежний совет создать пустую БД и перенести только
 `tm_routes`**. Сохраняются задачи и их ID, результаты отправок, смещения Telegram,
@@ -23,7 +46,7 @@ Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запу�
 
 `--upgrade-db` — встроенная офлайн-команда приложения, **не отдельный скрипт**.
 Она проверяет структуру и привязку к Telegram, создаёт проверенную SQLite-копию
-в `backups/pre-3.5.2-<время>-<суффикс>/`, затем одной транзакцией добавляет
+в `backups/pre-3.5.3-<время>-<суффикс>/`, затем одной транзакцией добавляет
 `tm_seen`, индекс срока хранения и поле `tm_jobs.retry_since`. Старые задачи,
 маршруты и смещение не переписываются. Архивные `queue_v2`, `queue_dead_letter`
 и другие старые таблицы остаются на месте, **но никогда не импортируются снова**.
@@ -35,14 +58,15 @@ Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запу�
 
 ### Порядок действий
 
-Распакуйте ZIP в `/home/htpc/telemax/update_3.5.2`, **не поверх работающих файлов**.
+Распакуйте ZIP в `/home/htpc/telemax/update_3.5.3`, **не поверх работающих файлов**.
 Все команды Python, тесты и операции с рабочими файлами выполняйте от `htpc`.
 Используйте Bash. Если каталог или имя сервиса другие, замените их согласованно.
 
 ```bash
-set -euo pipefail
+# Выполняйте блок по шагам; намеренно без `set -e`, чтобы ошибка команды
+# не закрыла интерактивную SSH-сессию.
 cd /home/htpc/telemax
-RELEASE="$PWD/update_3.5.2"
+RELEASE="$PWD/update_3.5.3"
 SERVICE=telemax.service
 
 # Проверки нового кода до остановки старого сервиса. Нет входа в MAX/Telegram.
@@ -55,7 +79,7 @@ sudo systemctl stop "$SERVICE"
 # Остановите и вручную запущенные экземпляры. Они используют тот же bot token.
 
 umask 077
-SNAP="$PWD/backups/manual-pre-3.5.2-$(date -u +%Y%m%dT%H%M%SZ)"
+SNAP="$PWD/backups/manual-pre-3.5.3-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -m 700 -p "$SNAP"
 sqlite3 telegram_queue.db ".backup '$SNAP/telegram_queue.db'"
 test "$(sqlite3 "$SNAP/telegram_queue.db" 'PRAGMA quick_check;')" = ok
@@ -110,7 +134,49 @@ sudo journalctl -u "$SERVICE" -n 80 --no-pager
 доставки и сохраняйте текущий снимок; автоматического безопасного «отката времени»
 здесь нет. Не удаляйте backup после одного успешного запуска.
 
-## Что изменилось в 3.5.2
+## Что изменилось в 3.5.3
+
+### Статус в General
+
+Telemax снова создаёт, обновляет и закрепляет одно status-сообщение в General. Оно
+обновляется каждые 15 минут и после перезапуска пытается переиспользовать ранее
+сохранённый/pinned status message. Если сообщение удалено, создаётся новое. `/status`
+остаётся доступен как ручная команда.
+
+### Ошибки команд больше не DLQ
+
+Ошибки ввода/валидации управляющих команд (`/clear_dlq` без `confirm`, неверный `/chat`,
+`/mute` вне топика и т.п.) возвращаются пользователю обычным сообщением и завершают
+command-job как обработанный. Они не создают `dead`/JSON diagnostic. Реальные ошибки
+доставки и `uncertain` по-прежнему остаются в DLQ.
+
+### PyMax update monitor
+
+Раз в сутки Telemax проверяет PyPI и при наличии более новой версии анализирует GitHub
+compare commit messages. Сам SDK **никогда не обновляется автоматически**. Обычная
+minor/patch без важных признаков показывается только в `/status`. General и ntfy
+получают одно уведомление на версию только при major-upgrade или явных признаках
+security/auth/session/protocol/reconnect/data-loss/upload/breaking изменений. Ошибка
+сети не влияет на работу моста; неудачная проверка повторяется позже.
+
+### CONTROL add
+
+`[Событие MAX: add]` отображается как `Добавление пользователя в группу`. Неизвестные
+CONTROL-коды по-прежнему сохраняют исходное значение, чтобы не угадывать семантику.
+
+### Фото Telegram → MAX
+
+Основной путь по-прежнему использует нативный `pymax.Photo`. Если pinned PyMax 2.4.1
+возвращает `UploadError` во время загрузки фото, Telemax безопасно повторяет эту картинку
+как обычный `File`. В PyMax 2.4.1 upload attachments выполняется до `MSG_SEND`, поэтому
+этот конкретный fallback не повторяет уже отправленное сообщение. Другие неоднозначные
+ошибки после начала send остаются `uncertain`.
+
+### ntfy и DLQ
+
+Периодический 30-минутный spam удалён. Последнее уведомлённое число DLQ хранится в
+`tm_meta`; ntfy отправляется один раз только при изменении количества `dead+uncertain`
+(включая сообщение об очистке до нуля). General diagnostics остаются отдельными.
 
 ### Текст и небинарные вложения
 
@@ -193,7 +259,7 @@ WAL и освобождает свободные страницы небольш
 сжатия и включения incremental auto-vacuum у обновлённой старой БД:
 
 ```bash
-set -euo pipefail
+# Выполняйте команды по одной; без `set -e`, чтобы ошибка не закрыла SSH shell.
 cd /home/htpc/telemax
 sudo systemctl stop telemax.service
 ./venv/bin/python telemax.py --compact-db
@@ -254,7 +320,9 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
   "DEDUP_DAYS": 90,
   "DEDUP_MAX_KEYS": 200000,
   "MEDIA_IPV4_ONLY": true,
-  "BLOCKED_IPV6_PREFIXES": []
+  "BLOCKED_IPV6_PREFIXES": [],
+  "PYMAX_UPDATE_CHECK": true,
+  "PYMAX_UPDATE_CHECK_HOURS": 24
 }
 ```
 
@@ -273,11 +341,16 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
 Неизвестные и повторяющиеся ключи конфигурации отклоняются. `MEDIA_LIMIT_MB`,
 `RETENTION_DAYS` и другие ключи из альтернативного старого комплекта не являются
 синонимами. `NTFY_URL` необязателен, пустая строка отключает уведомления.
+`PYMAX_UPDATE_CHECK` включает best-effort проверку PyPI/GitHub через `TG_PROXY`;
+`PYMAX_UPDATE_CHECK_HOURS` задаёт период, по умолчанию 24 часа. Новая версия SDK
+сама не устанавливается: обычная minor/patch только отображается в `/status`, а
+General/ntfy уведомляются лишь при признаках security/auth/session/protocol/reconnect/
+data-loss/upload/breaking изменений либо major-upgrade.
 
 ## Чистая установка — только если установки действительно ещё нет
 
 Не используйте этот раздел вместо обновления существующей БД.
-Пример нового каталога: `/home/htpc/telemax-3.5.2`, пользователь `htpc`.
+Пример нового каталога: `/home/htpc/telemax-3.5.3`, пользователь `htpc`.
 
 1. Нужны Python 3.10+, venv, `curl`, CA certificates, а для приведённых команд —
    `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:10808`
@@ -286,10 +359,10 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
 3. Подготовьте окружение и пустую БД:
 
 ```bash
-set -euo pipefail
+# Выполняйте команды по одной; без `set -e`, чтобы ошибка не закрыла SSH shell.
 umask 077
-mkdir -p /home/htpc/telemax-3.5.2
-cd /home/htpc/telemax-3.5.2
+mkdir -p /home/htpc/telemax-3.5.3
+cd /home/htpc/telemax-3.5.3
 python3 -c 'import sys; assert sys.version_info >= (3,10)'
 python3 -m venv venv
 ./venv/bin/python -m pip install 'maxapi-python==2.4.1'
@@ -331,8 +404,8 @@ After=network-online.target
 Type=notify
 User=htpc
 Group=htpc
-WorkingDirectory=/home/htpc/telemax-3.5.2
-ExecStart=/home/htpc/telemax-3.5.2/venv/bin/python /home/htpc/telemax-3.5.2/telemax.py
+WorkingDirectory=/home/htpc/telemax-3.5.3
+ExecStart=/home/htpc/telemax-3.5.3/venv/bin/python /home/htpc/telemax-3.5.3/telemax.py
 Restart=on-failure
 RestartSec=10
 WatchdogSec=30
