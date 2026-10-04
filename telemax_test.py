@@ -1046,7 +1046,7 @@ except importlib.metadata.PackageNotFoundError:
 @unittest.skipUnless(SDK_PRESENT, "maxapi-python is not installed; SDK checks require the service venv")
 class InstalledSDKTests(unittest.TestCase):
     def test_exact_version_and_media_exports(self):
-        client, config, media = app.load_sdk()
+        client, config, media, _ = app.load_sdk()
         self.assertEqual(importlib.metadata.version("maxapi-python"), "2.4.1")
         self.assertEqual(set(media), {"photo", "video", "document", "voice", "video_note"})
         self.assertIsNone(config(proxy=None).proxy)
@@ -1061,7 +1061,7 @@ class InstalledSDKTests(unittest.TestCase):
         self.assertTrue({"chat_id", "message_id", "file_id"} <= set(params))
 
     def test_native_file_constructor(self):
-        _, _, media = app.load_sdk()
+        _, _, media, _ = app.load_sdk()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "file.txt"
             path.write_text("SDK contract test")
@@ -1554,7 +1554,7 @@ class Release351Tests(BridgeFixture):
 @unittest.skipUnless(SDK_PRESENT, "maxapi-python is not installed; run in service venv")
 class Release351SDKTests(unittest.TestCase):
     def test_public_private_chat_methods_match_used_signatures(self):
-        Client, _, _ = app.load_sdk()
+        Client, _, _, _ = app.load_sdk()
         self.assertEqual(set(inspect.signature(Client.get_chat_id).parameters), {"self", "first_user_id", "second_user_id"})
         self.assertIn("phone", inspect.signature(Client.search_by_phone).parameters)
         self.assertIn("user_id", inspect.signature(Client.get_user).parameters)
