@@ -1,22 +1,22 @@
-# Telemax 3.5.3 — установка и обновление
+# Telemax 3.5.5 — установка и обновление
 
 Комплект: `telemax.py`, `telemax_test.py`, этот `deployment.md`. Python 3.10+,
 Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запуске не устанавливаются.
-Версия приложения **3.5.3**, формат БД **351** — разные номера: формат не меняется
+Версия приложения **3.5.5**, формат БД **351** — разные номера: формат не меняется
 просто из-за нового номера релиза.
 
-## Быстрое обновление с 3.5.2
+## Быстрое обновление с 3.5.4
 
-Формат БД в 3.5.3 остаётся **351**, поэтому для уже работающей 3.5.2 миграция не нужна.
+Формат БД в 3.5.5 остаётся **351**, поэтому для уже работающей 3.5.4 миграция не нужна.
 Остановите сервис, сделайте backup `telemax.py` и SQLite, замените `telemax.py` и
 `telemax_test.py`, выполните `--check`/тесты и запустите сервис. `constants.json`
-можно оставить без изменений: новые ключи update-check необязательны и имеют defaults.
+можно оставить без изменений: новый `MIRROR_RULES` необязателен и по умолчанию пуст.
 
 ```bash
 cd /home/htpc/telemax
 sudo systemctl stop telemax.service
-cp -p telemax.py "telemax.py.pre-3.5.3.$(date +%Y%m%d-%H%M%S)"
-sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.3.bak'"
+cp -p telemax.py "telemax.py.pre-3.5.5.$(date +%Y%m%d-%H%M%S)"
+sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.5.bak'"
 cp /path/to/release/telemax.py /path/to/release/telemax_test.py .
 ./venv/bin/python telemax.py --check
 ./venv/bin/python -m unittest -v telemax_test
@@ -46,7 +46,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 
 `--upgrade-db` — встроенная офлайн-команда приложения, **не отдельный скрипт**.
 Она проверяет структуру и привязку к Telegram, создаёт проверенную SQLite-копию
-в `backups/pre-3.5.3-<время>-<суффикс>/`, затем одной транзакцией добавляет
+в `backups/pre-3.5.5-<время>-<суффикс>/`, затем одной транзакцией добавляет
 `tm_seen`, индекс срока хранения и поле `tm_jobs.retry_since`. Старые задачи,
 маршруты и смещение не переписываются. Архивные `queue_v2`, `queue_dead_letter`
 и другие старые таблицы остаются на месте, **но никогда не импортируются снова**.
@@ -58,7 +58,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 
 ### Порядок действий
 
-Распакуйте ZIP в `/home/htpc/telemax/update_3.5.3`, **не поверх работающих файлов**.
+Распакуйте ZIP в `/home/htpc/telemax/update_3.5.5`, **не поверх работающих файлов**.
 Все команды Python, тесты и операции с рабочими файлами выполняйте от `htpc`.
 Используйте Bash. Если каталог или имя сервиса другие, замените их согласованно.
 
@@ -66,7 +66,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 # Выполняйте блок по шагам; намеренно без `set -e`, чтобы ошибка команды
 # не закрыла интерактивную SSH-сессию.
 cd /home/htpc/telemax
-RELEASE="$PWD/update_3.5.3"
+RELEASE="$PWD/update_3.5.5"
 SERVICE=telemax.service
 
 # Проверки нового кода до остановки старого сервиса. Нет входа в MAX/Telegram.
@@ -79,7 +79,7 @@ sudo systemctl stop "$SERVICE"
 # Остановите и вручную запущенные экземпляры. Они используют тот же bot token.
 
 umask 077
-SNAP="$PWD/backups/manual-pre-3.5.3-$(date -u +%Y%m%dT%H%M%SZ)"
+SNAP="$PWD/backups/manual-pre-3.5.5-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -m 700 -p "$SNAP"
 sqlite3 telegram_queue.db ".backup '$SNAP/telegram_queue.db'"
 test "$(sqlite3 "$SNAP/telegram_queue.db" 'PRAGMA quick_check;')" = ok
@@ -134,7 +134,25 @@ sudo journalctl -u "$SERVICE" -n 80 --no-pager
 доставки и сохраняйте текущий снимок; автоматического безопасного «отката времени»
 здесь нет. Не удаляйте backup после одного успешного запуска.
 
-## Что изменилось в 3.5.3
+## Что изменилось в 3.5.5
+
+- Добавлены `MIRROR_RULES`: один MAX source-chat может независимо пересылаться в другой
+  MAX chat через native forward и в произвольный Telegram chat/topic, включая forum
+  topic в группе, отличной от базовой `TG_CHAT_ID`. Каждое назначение имеет отдельный
+  durable job и собственный DLQ outcome.
+- Для mirror MAX → MAX добавлена ID-based loop protection; `/mute` базового Telemax
+  topic не отключает mirror rules. Повторная Telegram-копия может быть silent.
+- Системные MAX-события (`CONTROL`, add/join/remove/leave и service/action events)
+  отправляются в Telegram с `disable_notification=true`.
+- Сообщение «топик не привязан к MAX» показывается один раз на Telegram topic и
+  снова разрешается после успешного `/bind` или `/chat` в этом topic.
+- Native photo upload для PyMax 2.4.1 получил compatibility patch: Telemax больше
+  не превращает Telegram-фото в обычный `File` только из-за отсутствия `photoIds`
+  в новом upload URL MAX.
+- Опционально можно зеркалировать сообщения, отправленные своим MAX-аккаунтом через
+  другие клиенты: `FORWARD_OWN_MAX_MESSAGES=true`. Сообщения, отправленные самим
+  Telemax из Telegram, подавляются по точному MAX message ID, а не по тексту.
+
 
 ### Статус в General
 
@@ -322,7 +340,9 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
   "MEDIA_IPV4_ONLY": true,
   "BLOCKED_IPV6_PREFIXES": [],
   "PYMAX_UPDATE_CHECK": true,
-  "PYMAX_UPDATE_CHECK_HOURS": 24
+  "PYMAX_UPDATE_CHECK_HOURS": 24,
+  "FORWARD_OWN_MAX_MESSAGES": false,
+  "MIRROR_RULES": []
 }
 ```
 
@@ -346,11 +366,181 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
 сама не устанавливается: обычная minor/patch только отображается в `/status`, а
 General/ntfy уведомляются лишь при признаках security/auth/session/protocol/reconnect/
 data-loss/upload/breaking изменений либо major-upgrade.
+`FORWARD_OWN_MAX_MESSAGES=false` — безопасный default. При `true` Telemax пытается
+зеркалировать в Telegram сообщения, отправленные этим же MAX-аккаунтом через другие
+официальные/сторонние MAX-клиенты. Возможность зависит от того, присылает ли MAX такое
+событие текущей PyMax-сессии. Собственные отправки Telemax фильтруются по точному ID.
+
+
+### Дополнительное зеркалирование MAX → MAX / Telegram
+
+`MIRROR_RULES` задаёт независимый fan-out для конкретных MAX-чатов. Для каждого
+исходного сообщения создаются отдельные durable jobs `mirror_max` и/или `mirror_tg`;
+ошибка одного назначения не блокирует остальные. MAX → MAX использует нативный
+`client.forward_message()`, поэтому оригинальные вложения MAX не скачиваются и не
+загружаются повторно.
+
+Пример правила (фрагмент `constants.json`):
+
+```text
+"MIRROR_RULES": [
+  {
+    "SOURCE_MAX_CHAT_ID": -111111111,
+    "TARGET_MAX_CHAT_ID": -222222222,
+    "TARGET_TG_CHAT_ID": -1003333333333,
+    "TARGET_TG_THREAD_ID": 456,
+    "NORMAL_FORWARD": true,
+    "INCLUDE_OWN_MESSAGES": false,
+    "FORWARD_SYSTEM_EVENTS": false,
+    "SILENT_TG": true
+  }
+]
+```
+
+`TARGET_TG_CHAT_ID` может быть **другой Telegram-группой**, не базовой `TG_CHAT_ID`.
+Если это forum supergroup, `TARGET_TG_THREAD_ID` указывает существующий topic этой
+внешней группы. Для обычного Telegram-чата задайте `null`. Bot должен быть добавлен
+в этот чат и иметь право писать в выбранный topic; Telemax не создаёт внешний topic.
+
+`NORMAL_FORWARD=false` отключает для source-чата только обычный маршрут в базовый
+Telemax topic. `INCLUDE_OWN_MESSAGES=true` разрешает mirror-rule для сообщений,
+отправленных вашим MAX-аккаунтом через другой клиент, даже если глобальный
+`FORWARD_OWN_MAX_MESSAGES=false`. Сообщения, созданные самим Telemax, подавляются по
+точному returned MAX message ID, включая сообщения от `mirror_max`, поэтому цепочка
+mirror rules не зацикливается.
+
+`FORWARD_SYSTEM_EVENTS=false` не зеркалирует add/join/remove/control события в
+дополнительные назначения. `SILENT_TG=true` отправляет дополнительную Telegram-копию
+без push-уведомления. Системные события всегда silent в Telegram. `/mute` относится
+только к обычному topic в базовой группе и не отключает mirror rules.
+
+
+### Как получить ID для MIRROR_RULES
+
+#### SOURCE_MAX_CHAT_ID и TARGET_MAX_CHAT_ID
+
+Если чат уже известен Telemax, проще всего посмотреть сохранённые маршруты:
+
+```bash
+sqlite3 /home/htpc/telemax/telegram_queue.db "
+SELECT max_id,thread_id,name,type
+FROM tm_routes
+ORDER BY name;
+"
+```
+
+`max_id` — именно MAX chat ID, который нужен в `SOURCE_MAX_CHAT_ID` или
+`TARGET_MAX_CHAT_ID`. Не подставляйте MAX user ID вместо chat ID.
+
+Если нужного MAX-чата ещё нет в `tm_routes`, остановите Telemax и однократно получите
+список чатов через ту же сохранённую PyMax-сессию:
+
+```bash
+sudo systemctl stop telemax.service
+cd /home/htpc/telemax
+
+./venv/bin/python - <<'PYMAX'
+import asyncio, json
+from pathlib import Path
+from pymax import Client
+from pymax.config import ExtraConfig
+
+root = Path('/home/htpc/telemax')
+cfg = json.loads((root / 'constants.json').read_text(encoding='utf-8'))
+
+async def main():
+    client = Client(
+        phone=cfg['MAX_PHONE'],
+        work_dir=str(root / 'session_cache'),
+        extra_config=ExtraConfig(proxy=None),
+    )
+    await client.connect()
+    try:
+        chats = {c.id: c for c in (client.chats or [])}
+        for chat in await client.fetch_chats():
+            chats[chat.id] = chat
+        for chat_id, chat in sorted(
+            chats.items(), key=lambda item: str(getattr(item[1], 'title', '') or '').lower()
+        ):
+            print(f"{chat_id}\t{getattr(chat, 'type', '')}\t{getattr(chat, 'title', '') or ''}")
+    finally:
+        await client.close()
+
+asyncio.run(main())
+PYMAX
+```
+
+После получения ID снова запустите сервис. Если сессия действительна, повторный SMS
+не нужен.
+
+#### TARGET_TG_CHAT_ID и TARGET_TG_THREAD_ID внешней Telegram-группы
+
+1. Добавьте **того же Telegram-бота**, чей token находится в `TG_BOT_TOKEN`, во
+   внешнюю группу. Для существующего topic боту достаточно права отправлять сообщения;
+   Telemax не создаёт внешний topic.
+2. Остановите Telemax, чтобы одновременно не работали два `getUpdates` consumer:
+
+```bash
+sudo systemctl stop telemax.service
+```
+
+3. В нужном внешнем topic отправьте команду `/mirrorprobe` боту. Команда нужна также
+   при включённом Telegram privacy mode.
+4. Выполните из `/home/htpc/telemax` следующий probe. Token читается из файла и не
+   печатается в командной строке:
+
+```bash
+cd /home/htpc/telemax
+python3 - <<'TGPROBE'
+import json, subprocess
+from pathlib import Path
+
+cfg = json.loads(Path('constants.json').read_text(encoding='utf-8'))
+url = f"https://api.telegram.org/bot{cfg['TG_BOT_TOKEN']}/getUpdates"
+proxy = cfg.get('TG_PROXY', 'socks5h://127.0.0.1:10808')
+curl_config = (
+    f'url = "{url}"\n'
+    f'proxy = "{proxy}"\n'
+    'silent\nshow-error\nmax-time = 30\n'
+)
+result = subprocess.run(
+    ['curl', '-q', '--config', '-'], input=curl_config.encode(),
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+)
+data = json.loads(result.stdout)
+if not data.get('ok'):
+    raise SystemExit(data)
+for update in data.get('result', [])[-50:]:
+    message = update.get('message') or {}
+    chat = message.get('chat') or {}
+    if message:
+        print(
+            'chat_id=', chat.get('id'),
+            'title=', chat.get('title'),
+            'thread_id=', message.get('message_thread_id'),
+            'text=', message.get('text'),
+        )
+TGPROBE
+```
+
+Строка с `/mirrorprobe` даст:
+
+- `chat_id` → `TARGET_TG_CHAT_ID`;
+- `thread_id` → `TARGET_TG_THREAD_ID` для forum topic.
+
+Если назначение — обычная группа без topics, задайте `TARGET_TG_THREAD_ID: null`.
+Вызов `getUpdates` без повышенного `offset` сам по себе не подтверждает/удаляет update;
+после проверки запустите Telemax обратно:
+
+```bash
+sudo systemctl start telemax.service
+```
+
 
 ## Чистая установка — только если установки действительно ещё нет
 
 Не используйте этот раздел вместо обновления существующей БД.
-Пример нового каталога: `/home/htpc/telemax-3.5.3`, пользователь `htpc`.
+Пример нового каталога: `/home/htpc/telemax-3.5.5`, пользователь `htpc`.
 
 1. Нужны Python 3.10+, venv, `curl`, CA certificates, а для приведённых команд —
    `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:10808`
@@ -361,8 +551,8 @@ data-loss/upload/breaking изменений либо major-upgrade.
 ```bash
 # Выполняйте команды по одной; без `set -e`, чтобы ошибка не закрыла SSH shell.
 umask 077
-mkdir -p /home/htpc/telemax-3.5.3
-cd /home/htpc/telemax-3.5.3
+mkdir -p /home/htpc/telemax-3.5.5
+cd /home/htpc/telemax-3.5.5
 python3 -c 'import sys; assert sys.version_info >= (3,10)'
 python3 -m venv venv
 ./venv/bin/python -m pip install 'maxapi-python==2.4.1'
@@ -404,8 +594,8 @@ After=network-online.target
 Type=notify
 User=htpc
 Group=htpc
-WorkingDirectory=/home/htpc/telemax-3.5.3
-ExecStart=/home/htpc/telemax-3.5.3/venv/bin/python /home/htpc/telemax-3.5.3/telemax.py
+WorkingDirectory=/home/htpc/telemax-3.5.5
+ExecStart=/home/htpc/telemax-3.5.5/venv/bin/python /home/htpc/telemax-3.5.5/telemax.py
 Restart=on-failure
 RestartSec=10
 WatchdogSec=30

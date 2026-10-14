@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.3 — MAX <-> Telegram bridge.
+"""Telemax 3.5.5 — MAX <-> Telegram bridge.
 
 Python 3.10+; maxapi-python==2.4.1; curl; Linux.
 Configure constants.json, run --init once, then start normally.
@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-VERSION = "3.5.3"
+VERSION = "3.5.5"
 SCHEMA_VERSION = "351"  # Storage format, not application release number.
 UPGRADE_SCHEMAS = {"3", "350"}
 SDK_VERSION = "2.4.1"
@@ -203,6 +203,19 @@ def control_text(attachment: dict) -> str:
     return text + (f" {title}" if title else "")
 
 
+def silent_max_event(data: dict) -> bool:
+    """System/control events are mirrored without Telegram push notifications."""
+    if str(data.get("action") or "").strip():
+        return True
+    event_type = kind(data.get("type"))
+    if event_type in {"ADD", "JOIN", "REMOVE", "LEAVE", "SYSTEM", "SERVICE", "EVENT", "ACTION"}:
+        return True
+    for item in data.get("files") or []:
+        if isinstance(item, dict) and kind(item.get("type") or item.get("unsupported")) == "CONTROL":
+            return True
+    return False
+
+
 def attachment_text(attachment: dict) -> str:
     """Render known non-file MAX attachments without pretending to sync native widgets."""
     a = attachment.get("raw") if isinstance(attachment.get("raw"), dict) else attachment
@@ -348,6 +361,22 @@ def tg_parts(text: str, files: list[dict]) -> list[dict]:
 
 
 @dataclasses.dataclass(frozen=True)
+class MirrorRule:
+    source_max_chat_id: int
+    target_max_chat_id: int | None = None
+    target_tg_chat_id: int | None = None
+    target_tg_thread_id: int | None = None
+    normal_forward: bool = True
+    include_own_messages: bool = False
+    forward_system_events: bool = False
+    silent_tg: bool = True
+
+    @property
+    def tg_route(self) -> str:
+        return f"mirror-tg:{self.target_tg_chat_id}:{self.target_tg_thread_id or 0}"
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     root: Path
     phone: str
@@ -377,6 +406,8 @@ class Config:
     blocked_ipv6_prefixes: tuple[str, ...] = ()
     pymax_update_check: bool = True
     pymax_update_hours: int = 24
+    forward_own_max_messages: bool = False
+    mirror_rules: tuple[MirrorRule, ...] = ()
 
     KEYS = frozenset({
         "MAX_PHONE", "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_ALLOWED_USER_IDS",
@@ -386,6 +417,7 @@ class Config:
         "INBOX_LIMIT_MB", "WORKERS", "DOWNLOAD_WORKERS", "RETRY_WINDOW_SECONDS",
         "HISTORY_MAX_JOBS", "DEDUP_DAYS", "DEDUP_MAX_KEYS", "MEDIA_IPV4_ONLY",
         "BLOCKED_IPV6_PREFIXES", "PYMAX_UPDATE_CHECK", "PYMAX_UPDATE_CHECK_HOURS",
+        "FORWARD_OWN_MAX_MESSAGES", "MIRROR_RULES",
     })
 
     @property
@@ -464,6 +496,9 @@ class Config:
         update_check = data.get("PYMAX_UPDATE_CHECK", True)
         if not isinstance(update_check, bool):
             raise ValueError("PYMAX_UPDATE_CHECK must be true or false")
+        forward_own = data.get("FORWARD_OWN_MAX_MESSAGES", False)
+        if not isinstance(forward_own, bool):
+            raise ValueError("FORWARD_OWN_MAX_MESSAGES must be true or false")
         networks = data.get("BLOCKED_IPV6_PREFIXES", [])
         if not isinstance(networks, list) or not all(isinstance(n, str) for n in networks):
             raise ValueError("BLOCKED_IPV6_PREFIXES must be a JSON array of IPv6 CIDRs")
@@ -471,6 +506,70 @@ class Config:
         workers, downloads = positive("WORKERS", 4), positive("DOWNLOAD_WORKERS", 3)
         if workers > 16 or downloads > 16:
             raise ValueError("WORKERS and DOWNLOAD_WORKERS must be between 1 and 16")
+
+        raw_rules = data.get("MIRROR_RULES", [])
+        if not isinstance(raw_rules, list):
+            raise ValueError("MIRROR_RULES must be a JSON array")
+        mirror_rules: list[MirrorRule] = []
+        normal_by_source: dict[int, bool] = {}
+        mirror_destinations: set[tuple[Any, ...]] = set()
+        allowed_rule_keys = {
+            "SOURCE_MAX_CHAT_ID", "TARGET_MAX_CHAT_ID", "TARGET_TG_CHAT_ID",
+            "TARGET_TG_THREAD_ID", "NORMAL_FORWARD", "INCLUDE_OWN_MESSAGES",
+            "FORWARD_SYSTEM_EVENTS", "SILENT_TG",
+        }
+        for index, raw in enumerate(raw_rules):
+            if not isinstance(raw, dict):
+                raise ValueError(f"MIRROR_RULES[{index}] must be an object")
+            unknown_rule = sorted(set(raw) - allowed_rule_keys)
+            if unknown_rule:
+                raise ValueError(f"Unknown MIRROR_RULES[{index}] setting(s): " + ", ".join(unknown_rule))
+            source = number(raw.get("SOURCE_MAX_CHAT_ID"))
+            target_max = number(raw.get("TARGET_MAX_CHAT_ID"))
+            target_tg = number(raw.get("TARGET_TG_CHAT_ID"))
+            thread = number(raw.get("TARGET_TG_THREAD_ID"))
+            if source is None or source == 0:
+                raise ValueError(f"MIRROR_RULES[{index}].SOURCE_MAX_CHAT_ID must be a non-zero integer")
+            if raw.get("TARGET_MAX_CHAT_ID") is not None and (target_max is None or target_max == 0):
+                raise ValueError(f"MIRROR_RULES[{index}].TARGET_MAX_CHAT_ID must be a non-zero integer or null")
+            if raw.get("TARGET_TG_CHAT_ID") is not None and (target_tg is None or target_tg == 0):
+                raise ValueError(f"MIRROR_RULES[{index}].TARGET_TG_CHAT_ID must be a non-zero integer or null")
+            if raw.get("TARGET_TG_THREAD_ID") is not None and (thread is None or thread <= 0):
+                raise ValueError(f"MIRROR_RULES[{index}].TARGET_TG_THREAD_ID must be a positive integer or null")
+            if thread is not None and target_tg is None:
+                raise ValueError(f"MIRROR_RULES[{index}] cannot set TARGET_TG_THREAD_ID without TARGET_TG_CHAT_ID")
+            if target_max is None and target_tg is None:
+                raise ValueError(f"MIRROR_RULES[{index}] needs TARGET_MAX_CHAT_ID and/or TARGET_TG_CHAT_ID")
+            if target_max == source:
+                raise ValueError(f"MIRROR_RULES[{index}] TARGET_MAX_CHAT_ID must differ from SOURCE_MAX_CHAT_ID")
+            bools = {}
+            for key, default in (("NORMAL_FORWARD", True), ("INCLUDE_OWN_MESSAGES", False),
+                                 ("FORWARD_SYSTEM_EVENTS", False), ("SILENT_TG", True)):
+                value = raw.get(key, default)
+                if not isinstance(value, bool):
+                    raise ValueError(f"MIRROR_RULES[{index}].{key} must be true or false")
+                bools[key] = value
+            previous_normal = normal_by_source.setdefault(source, bools["NORMAL_FORWARD"])
+            if previous_normal != bools["NORMAL_FORWARD"]:
+                raise ValueError(f"MIRROR_RULES for MAX chat {source} must use the same NORMAL_FORWARD value")
+            destinations = []
+            if target_max is not None:
+                destinations.append((source, "max", target_max))
+            if target_tg is not None:
+                destinations.append((source, "tg", target_tg, thread or 0))
+            duplicate = next((item for item in destinations if item in mirror_destinations), None)
+            if duplicate is not None:
+                raise ValueError(f"MIRROR_RULES[{index}] duplicates an existing destination for MAX chat {source}")
+            mirror_destinations.update(destinations)
+            mirror_rules.append(MirrorRule(
+                source_max_chat_id=source, target_max_chat_id=target_max,
+                target_tg_chat_id=target_tg, target_tg_thread_id=thread,
+                normal_forward=bools["NORMAL_FORWARD"],
+                include_own_messages=bools["INCLUDE_OWN_MESSAGES"],
+                forward_system_events=bools["FORWARD_SYSTEM_EVENTS"],
+                silent_tg=bools["SILENT_TG"],
+            ))
+
         return cls(path.resolve().parent, phone, token, chat_id,
                    ids("TG_ALLOWED_USER_IDS"), ids("TG_ADMIN_USER_IDS"), own, proxy, ntfy,
                    positive("MAX_MEDIA_MB", 49) * 1024**2,
@@ -482,7 +581,8 @@ class Config:
                    positive("INBOX_LIMIT_MB", 512) * 1024**2, workers, downloads,
                    positive("RETRY_WINDOW_SECONDS", 86400), positive("HISTORY_MAX_JOBS", 10000),
                    positive("DEDUP_DAYS", 90), positive("DEDUP_MAX_KEYS", 200000),
-                   ipv4_only, networks, update_check, positive("PYMAX_UPDATE_CHECK_HOURS", 24))
+                   ipv4_only, networks, update_check, positive("PYMAX_UPDATE_CHECK_HOURS", 24),
+                   forward_own, tuple(mirror_rules))
 
     def authorized(self, msg: dict, *, admin: bool = False) -> bool:
         sender = msg.get("from") or {}
@@ -490,6 +590,12 @@ class Config:
                 and not msg.get("sender_chat") and not sender.get("is_bot")
                 and not msg.get("is_automatic_forward")
                 and number(sender.get("id")) in (self.admins if admin else self.allowed | self.admins))
+
+    def mirrors_for(self, chat_id: Any) -> tuple[MirrorRule, ...]:
+        target = number(chat_id)
+        if target is None:
+            return ()
+        return tuple(rule for rule in self.mirror_rules if rule.source_max_chat_id == target)
 
 
 class RedactedFormatter(logging.Formatter):
@@ -828,6 +934,19 @@ class Store:
     async def muted(self, route: str) -> bool:
         return await self.tx(lambda c: self.muted_in_tx(c, route))
 
+    async def base_forward_allowed(self, route: str, received_at: float | int | None = None) -> bool:
+        """Mute controls only the normal MAX -> base Telegram topic path, not mirror rules."""
+        def op(c):
+            row = c.execute("SELECT value FROM tm_meta WHERE key=?", ("mute:" + str(route),)).fetchone()
+            if not row:
+                return True
+            policy = payload_object(row[0])
+            if policy.get("muted") is True:
+                return False
+            cutoff = float(policy.get("discard_before") or 0)
+            return not (isinstance(received_at, (float, int)) and received_at <= cutoff)
+        return await self.tx(op)
+
     @staticmethod
     def cancel_muted_in_tx(c, job_id: int):
         c.execute("UPDATE tm_jobs SET state='cancelled',phase='',error='',result=?,updated=? "
@@ -837,7 +956,17 @@ class Store:
     async def forward_allowed(self, job: dict, *, sending=False) -> bool:
         def op(c):
             row = c.execute("SELECT state FROM tm_jobs WHERE id=?", (job["id"],)).fetchone()
-            if not row or row[0] == "cancelled" or self.muted_in_tx(c, job["route"]):
+            if not row or row[0] == "cancelled":
+                self.cancel_muted_in_tx(c, job["id"])
+                return False
+            policy_row = c.execute("SELECT value FROM tm_meta WHERE key=?",
+                                   ("mute:" + str(job["route"]),)).fetchone()
+            policy = payload_object(policy_row[0]) if policy_row else {}
+            payload = payload_object(job.get("payload") or "{}")
+            received = payload.get("received_at")
+            stale_muted = (isinstance(received, (float, int))
+                           and received <= float(policy.get("discard_before") or 0))
+            if policy.get("muted") is True or stale_muted:
                 self.cancel_muted_in_tx(c, job["id"])
                 return False
             if sending:
@@ -856,15 +985,21 @@ class Store:
                 return False
             self.capacity(c)
             jid = self.insert(c, key, job_kind, route, payload)
-            if job_kind in {"max_in", "to_tg"}:
-                policy_row = c.execute("SELECT value FROM tm_meta WHERE key=?", ("mute:" + str(route),)).fetchone()
-                policy = payload_object(policy_row[0]) if policy_row else {}
-                received = payload.get("received_at")
-                stale_muted = (job_kind == "max_in" and isinstance(received, (float, int))
-                               and received <= float(policy.get("discard_before") or 0))
-                if self.muted_in_tx(c, str(route)) or stale_muted:
-                    self.cancel_muted_in_tx(c, jid)
+            if job_kind == "to_tg" and self.muted_in_tx(c, str(route)):
+                self.cancel_muted_in_tx(c, jid)
             return True
+        return await self.tx(op)
+
+    async def seen(self, key: str) -> bool:
+        rows = await self.read("SELECT 1 AS ok FROM tm_seen WHERE key=? AND expires>? LIMIT 1",
+                               (key, time.time()))
+        return bool(rows)
+
+    async def claim_meta_once(self, key: str, value: Any = None) -> bool:
+        stamp = str(time.time() if value is None else value)
+        def op(c):
+            cur = c.execute("INSERT OR IGNORE INTO tm_meta(key,value) VALUES(?,?)", (key, stamp))
+            return bool(cur.rowcount)
         return await self.tx(op)
 
     async def accept_updates(self, updates: list[dict]):
@@ -930,7 +1065,7 @@ class Store:
 
     async def expand(self, job: dict, specs: list[tuple[str, str, dict]]):
         def op(c):
-            if job["kind"] in {"max_in", "to_tg"}:
+            if job["kind"] == "to_tg":
                 row = c.execute("SELECT state FROM tm_jobs WHERE id=?", (job["id"],)).fetchone()
                 if (row and row[0] == "cancelled") or self.muted_in_tx(c, job["route"]):
                     self.cancel_muted_in_tx(c, job["id"])
@@ -1648,7 +1783,9 @@ class Bridge:
             data = {"id": get(message, "id"), "chat_id": get(message, "chat_id"),
                     "sender": get(message, "sender"), "text": "", "files": [],
                     "normalization_error": type(exc).__name__}
-        if own_message(data, self.own_id):
+        is_own = own_message(data, self.own_id)
+        mirror_own = is_own and any(rule.include_own_messages for rule in self.cfg.mirrors_for(data.get("chat_id")))
+        if is_own and not (self.cfg.forward_own_max_messages or mirror_own):
             return
         data["raw_message"], data["received_at"] = raw, time.time()
         data["max_account_id"] = self.own_id
@@ -1733,14 +1870,29 @@ class Bridge:
             return f"ID:{sid}"
 
     async def prepare_max(self, job: dict, data: dict):
-        if not await self.store.forward_allowed(job):
-            return
         if number(data.get("chat_id")) is None or data.get("id") is None:
             raise Permanent("MAX event has no stable chat/message ID; raw normalized payload retained")
-        if own_message(data, self.own_id):
-            await self.store.finish(job)
-            return
         target = str(data["chat_id"])
+        rules = self.cfg.mirrors_for(data.get("chat_id"))
+        is_own = own_message(data, self.own_id)
+        if is_own:
+            allow_own_anywhere = self.cfg.forward_own_max_messages or any(
+                rule.include_own_messages for rule in rules)
+            if not allow_own_anywhere:
+                await self.store.finish(job)
+                return
+            marker = f"selfsent:{data['chat_id']}:{data['id']}"
+            if await self.store.seen(marker):
+                await self.store.finish(job, {"suppressed": "telemax-originated"})
+                return
+            # A MAX notification can race the response to our own send/forward. Wait for
+            # the exact returned message ID to be persisted before deciding it is external.
+            active = await self.store.read(
+                "SELECT 1 AS active FROM tm_jobs WHERE kind IN ('to_max','mirror_max') AND route=? "
+                "AND state='running' AND phase='send' LIMIT 1", (target,))
+            if active:
+                raise Retry("Waiting for own-message correlation", 2, count=False)
+
         rows = await self.store.read("SELECT * FROM tm_routes WHERE max_id=?", (target,))
         title, chat_type = data.get("title"), "group"
         if rows:
@@ -1783,12 +1935,15 @@ class Bridge:
             if typ not in MEDIA_TYPES:
                 text += "\n" + attachment_text(f)
                 continue
-            default = {"PHOTO": "photo.jpg", "VIDEO": "video.mp4", "AUDIO": "voice.ogg", "VOICE": "voice.ogg", "STICKER": "sticker.webp"}.get(typ, "attachment.bin")
+            default = {"PHOTO": "photo.jpg", "VIDEO": "video.mp4", "AUDIO": "voice.ogg",
+                       "VOICE": "voice.ogg", "STICKER": "sticker.webp"}.get(typ, "attachment.bin")
             f["name"] = safe_name(f.get("name") or f.get("file_name"), default)
-            f["kind"] = {"PHOTO": "photo", "VIDEO": "video", "AUDIO": "voice", "VOICE": "voice", "STICKER": "photo"}.get(typ, "document")
+            f["kind"] = {"PHOTO": "photo", "VIDEO": "video", "AUDIO": "voice",
+                         "VOICE": "voice", "STICKER": "photo"}.get(typ, "document")
             f.pop("unsupported", None)
             normalized.append(f)
-        if any(isinstance(f, dict) and kind(f.get("type")) not in MEDIA_TYPES | {"SHARE", "CONTROL", "CONTACT", "POLL", "CALL"} for f in files):
+        if any(isinstance(f, dict) and kind(f.get("type")) not in
+               MEDIA_TYPES | {"SHARE", "CONTROL", "CONTACT", "POLL", "CALL"} for f in files):
             async with self.diagnostic_lock:
                 try:
                     detail, _ = await self.error_details(job)
@@ -1796,13 +1951,50 @@ class Bridge:
                     await asyncio.to_thread(self.write_error_dump, job["id"], detail)
                 except (OSError, ValueError, TypeError):
                     LOG.error("Fallback JSON could not be written for job %s; source remains in DB", job["id"])
+
         parts = independent_tg_parts(f"{header}\n{text}".strip(), normalized)
-        for part in parts:
-            part["source_key"] = job["key"]
-            part["context"] = {"time": data.get("time"), "time_unit": "ms",
-                               "sender": data.get("sender"), "sender_name": name,
-                               "message_id": data.get("id"), "recipient": title}
-        await self.store.expand(job, [("to_tg", target, p) for p in parts])
+        system_event = silent_max_event(data)
+        context = {"time": data.get("time"), "time_unit": "ms",
+                   "sender": data.get("sender"), "sender_name": name,
+                   "message_id": data.get("id"), "recipient": title}
+        specs: list[tuple[str, str, dict]] = []
+
+        normal_forward = rules[0].normal_forward if rules else True
+        base_allowed = await self.store.base_forward_allowed(target, data.get("received_at"))
+        if normal_forward and base_allowed and (not is_own or self.cfg.forward_own_max_messages):
+            for base_part in parts:
+                part = {**base_part, "files": [dict(f) for f in base_part.get("files") or []],
+                        "source_key": job["key"], "context": dict(context),
+                        "received_at": data.get("received_at")}
+                if system_event:
+                    part["silent"] = True
+                specs.append(("to_tg", target, part))
+
+        for rule_index, rule in enumerate(rules):
+            if is_own and not rule.include_own_messages:
+                continue
+            if system_event and not rule.forward_system_events:
+                continue
+            if rule.target_max_chat_id is not None:
+                specs.append(("mirror_max", str(rule.target_max_chat_id), {
+                    "source_key": job["key"], "source_chat_id": int(target),
+                    "source_message_id": data["id"], "context": dict(context),
+                    "mirror_rule": rule_index,
+                }))
+            if rule.target_tg_chat_id is not None:
+                for base_part in parts:
+                    part = {**base_part, "files": [dict(f) for f in base_part.get("files") or []],
+                            "source_key": job["key"], "context": dict(context),
+                            "tg_chat_id": rule.target_tg_chat_id,
+                            "tg_thread_id": rule.target_tg_thread_id,
+                            "silent": bool(rule.silent_tg or system_event),
+                            "mirror_rule": rule_index}
+                    specs.append(("mirror_tg", rule.tg_route, part))
+
+        if specs:
+            await self.store.expand(job, specs)
+        else:
+            await self.store.finish(job, {"fanout": 0})
 
     def notice_specs(self, text: str, thread=None) -> list[tuple[str, str, dict]]:
         thread = None if thread == 1 else thread
@@ -1814,7 +2006,14 @@ class Bridge:
             raise Permanent("Sender is no longer authorized")
         target = number(data.get("target"))
         if target is None:
-            await self.store.expand(job, self.notice_specs("Нет привязки к MAX. Администратор может выполнить /chat MAX_USER_ID для нового личного диалога или /bind MAX_CHAT_ID для существующего чата.", msg.get("message_thread_id")))
+            thread = number(msg.get("message_thread_id"))
+            key = f"unbound_notice:{thread}"
+            if thread and await self.store.claim_meta_once(key):
+                await self.store.expand(job, self.notice_specs(
+                    "Нет привязки к MAX. Администратор может выполнить /chat MAX_USER_ID для нового личного диалога или /bind MAX_CHAT_ID для существующего чата.",
+                    thread))
+            else:
+                await self.store.finish(job, {"ignored": "unbound-topic-notice-already-sent"})
             return
         text = str(msg.get("text") or msg.get("caption") or "")
         file = None
@@ -1883,7 +2082,15 @@ class Bridge:
             if f.get("source") not in {"max", "telegram", "legacy"}:
                 raise Permanent("Unsupported media source; descriptor retained")
             if "path" not in f:
-                f["path"] = str(self.cfg.media / f"tm_{job['id']}_{index}_{safe_name(f.get('name'))}")
+                if f.get("source") == "max" and f.get("chat_id") is not None and f.get("message_id") is not None:
+                    identity = {k: f.get(k) for k in
+                                ("chat_id", "message_id", "type", "id", "file_id", "photo_id",
+                                 "video_id", "audio_id", "sticker_id", "token", "name")}
+                    digest = hashlib.sha256(jdump(identity).encode("utf-8")).hexdigest()[:20]
+                    filename = f"max_{digest}_{safe_name(f.get('name'))}"
+                else:
+                    filename = f"tm_{job['id']}_{index}_{safe_name(f.get('name'))}"
+                f["path"] = str(self.cfg.media / filename)
                 await self.store.payload(job, data)  # Reference exists BEFORE the file does.
             path = self.downloads.checked_path(f["path"])
             if path.exists() and path.stat().st_size > 0:
@@ -1932,21 +2139,14 @@ class Bridge:
             paths.append(path)
         return paths
 
-    async def send_tg(self, job: dict, data: dict):
-        if not await self.store.forward_allowed(job):
-            return
-        repaired, changed = remove_controls(data)
-        if changed or (repaired.get("text") and repaired.get("files")):
-            parts = independent_tg_parts(repaired.get("text") or "", repaired.get("files") or [])
-            for part in parts:
-                part["source_key"] = data.get("source_key") or job["key"].split("/", 1)[0]
-                if data.get("context"):
-                    part["context"] = data["context"]
-            await self.store.expand(job, [("to_tg", job["route"], part) for part in parts])
-            return
-        thread = await self.ensure_topic(job["route"])
+    async def _send_tg_destination(self, job: dict, data: dict, chat_id: int,
+                                   thread: int | None, *, base_route: bool = False):
         paths = await self.materialize(job, data)
-        params = {"chat_id": self.cfg.chat_id, "message_thread_id": thread}
+        params: dict[str, Any] = {"chat_id": chat_id}
+        if thread is not None:
+            params["message_thread_id"] = thread
+        if data.get("silent"):
+            params["disable_notification"] = True
         text = data.get("text") or ""
         media = data.get("files") or []
         files = {}
@@ -1959,7 +2159,6 @@ class Bridge:
             field = media[0]["kind"]
             if field not in {"photo", "video", "voice", "document"}:
                 field = "document"
-            # sendPhoto has a smaller file-size limit than sendDocument.
             if field == "photo" and paths[0].stat().st_size > 10 * 1024**2:
                 field = "document"
             method, files = "send" + field.capitalize(), {field: paths[0]}
@@ -1969,32 +2168,96 @@ class Bridge:
                 raise Permanent("Invalid album size")
             if any(f["kind"] not in {"photo", "video"} for f in media):
                 raise Permanent("Mixed unsupported album types")
-            if any(f["kind"] == "photo" and p.stat().st_size > 10 * 1024**2 for f, p in zip(media, paths)):
+            if any(f["kind"] == "photo" and p.stat().st_size > 10 * 1024**2
+                   for f, p in zip(media, paths)):
                 raise Permanent("Album photo exceeds Telegram photo limit; original files retained")
             method = "sendMediaGroup"
             items = []
-            for i, (f, p) in enumerate(zip(media, paths)):
+            for i, (f, path) in enumerate(zip(media, paths)):
                 key = f"file{i}"
-                files[key] = p
+                files[key] = path
                 items.append({"type": f["kind"], "media": f"attach://{key}"})
             items[0]["caption"] = text
             params["media"] = jdump(items)
 
         async def send():
-            if not await self.store.forward_allowed(job, sending=True):
-                raise Suppressed()
+            if base_route:
+                if not await self.store.forward_allowed(job, sending=True):
+                    raise Suppressed()
+            else:
+                await self.store.phase(job, "send")
             return await self.tg.call(method, params, files or None, timeout=300 if paths else 40)
+
         response = await self.tg.paced(send)
-        if response.code == 400 and any(s in response.error.lower() for s in ("thread not found", "message thread not found", "topic not found")):
-            await self.store.tx(lambda c: c.execute("UPDATE tm_routes SET thread_id=NULL,state='new' WHERE max_id=? AND thread_id=?", (job["route"], thread)).rowcount)
-            raise Retry("Telegram topic was deleted; route retained, topic will be recreated", 5)
+        if response.code == 400 and any(s in response.error.lower() for s in
+                                        ("thread not found", "message thread not found", "topic not found")):
+            if base_route:
+                await self.store.tx(lambda c: c.execute(
+                    "UPDATE tm_routes SET thread_id=NULL,state='new' WHERE max_id=? AND thread_id=?",
+                    (job["route"], thread)).rowcount)
+                raise Retry("Telegram topic was deleted; route retained, topic will be recreated", 5)
+            raise Permanent("Mirror Telegram topic not found; check TARGET_TG_CHAT_ID/TARGET_TG_THREAD_ID")
         result = require_api(response, sending=True)
         delivered = result if isinstance(result, list) else [result]
         if (not delivered or any(not get(x, "message_id") for x in delivered)
                 or (method == "sendMediaGroup" and len(delivered) != len(paths))):
             raise Uncertain("Telegram accepted request without expected message IDs")
-        await self.store.finish(job, {"ids": [get(x, "message_id") for x in delivered]})
-        await self.store.set_meta("tg_delivered", time.time())
+        await self.store.finish(job, {"ids": [get(x, "message_id") for x in delivered],
+                                      "chat_id": chat_id, "thread_id": thread})
+        await self.store.set_meta("tg_delivered" if base_route else "mirror_tg_delivered", time.time())
+
+    async def send_tg(self, job: dict, data: dict):
+        if not await self.store.forward_allowed(job):
+            return
+        repaired, changed = remove_controls(data)
+        if changed or (repaired.get("text") and repaired.get("files")):
+            parts = independent_tg_parts(repaired.get("text") or "", repaired.get("files") or [])
+            for part in parts:
+                part["source_key"] = data.get("source_key") or job["key"].split("/", 1)[0]
+                if data.get("context"):
+                    part["context"] = data["context"]
+                if data.get("silent"):
+                    part["silent"] = True
+            await self.store.expand(job, [("to_tg", job["route"], part) for part in parts])
+            return
+        thread = await self.ensure_topic(job["route"])
+        await self._send_tg_destination(job, data, self.cfg.chat_id, thread, base_route=True)
+
+    async def send_mirror_tg(self, job: dict, data: dict):
+        chat_id = number(data.get("tg_chat_id"))
+        thread = number(data.get("tg_thread_id"))
+        if chat_id is None or chat_id == 0:
+            raise Permanent("Mirror Telegram destination has invalid TARGET_TG_CHAT_ID")
+        if data.get("tg_thread_id") is not None and (thread is None or thread <= 0):
+            raise Permanent("Mirror Telegram destination has invalid TARGET_TG_THREAD_ID")
+        await self._send_tg_destination(job, data, chat_id, thread, base_route=False)
+
+    async def send_mirror_max(self, job: dict, data: dict):
+        if not self.max_available.is_set():
+            raise Retry("MAX connection unavailable", 30, count=False)
+        source_chat = number(data.get("source_chat_id"))
+        source_message = data.get("source_message_id")
+        target_chat = number(job.get("route"))
+        if source_chat is None or source_message is None or target_chat is None:
+            raise Permanent("Mirror MAX job has invalid source/target IDs")
+        await self.store.phase(job, "send")
+        try:
+            response = await asyncio.wait_for(self.client.forward_message(
+                chat_id=target_chat, message_id=source_message, source_chat_id=source_chat), 120)
+        except Exception as exc:
+            raise Uncertain(f"MAX mirror forward result unknown ({type(exc).__name__}); check before forced retry") from exc
+        mid = get(response, "id")
+        if mid is None:
+            raise Uncertain("MAX mirror forward returned no message ID")
+
+        def finish(c):
+            self.store.finish_in_tx(c, job, {"id": str(mid), "source_chat_id": source_chat,
+                                             "source_message_id": str(source_message)})
+            c.execute("INSERT INTO tm_seen(key,expires) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET expires=MAX(expires,excluded.expires)",
+                      (f"selfsent:{target_chat}:{mid}", time.time() + self.cfg.dedup_days * 86400))
+        await self.store.tx(finish)
+        await self.store.set_meta("mirror_max_delivered", time.time())
 
     async def send_max(self, job: dict, data: dict):
         origin = data.get("origin") or {}
@@ -2004,61 +2267,43 @@ class Bridge:
             raise Retry("MAX connection unavailable", 30, count=False)
         paths = await self.materialize(job, data)
 
-        def build_attachments(*, photo_as_file=False):
-            attachments = []
-            for f, path in zip(data.get("files") or [], paths):
-                typ = f.get("kind", "document")
-                if typ == "voice" and path.suffix.lower() != ".ogg":
-                    typ = "document"  # Do not relabel or pretend to transcode MP3/OPUS.
-                if typ == "photo" and photo_as_file:
-                    typ = "document"
-                klass = self.media_classes[typ if typ in self.media_classes else "document"]
-                kwargs = {"path": str(path)}
-                if typ == "video_note":
-                    kwargs["duration"] = int(f.get("duration") or 1) * 1000
-                attachments.append(klass(**kwargs))
-            return attachments
+        attachments = []
+        for f, path in zip(data.get("files") or [], paths):
+            typ = f.get("kind", "document")
+            if typ == "voice" and path.suffix.lower() != ".ogg":
+                typ = "document"
+            klass = self.media_classes[typ if typ in self.media_classes else "document"]
+            kwargs = {"path": str(path)}
+            if typ == "video_note":
+                kwargs["duration"] = int(f.get("duration") or 1) * 1000
+            attachments.append(klass(**kwargs))
 
-        has_photo = any(f.get("kind") == "photo" for f in data.get("files") or [])
-        attachments = build_attachments()
-        photo_fallback = False
         await self.store.phase(job, "send")
         try:
             response = await asyncio.wait_for(self.client.send_message(
                 chat_id=int(job["route"]), text=data.get("text") or "",
                 attachments=attachments or None), 300)
         except Exception as exc:
-            # In pinned PyMax 2.4.1 UploadError is raised while attachments are uploaded,
-            # before the MSG_SEND frame. Therefore this specific error is definitely unsent.
+            # UploadError is raised before MSG_SEND, so retrying cannot duplicate a message.
             if self.upload_error_cls and isinstance(exc, self.upload_error_cls):
-                if has_photo:
-                    LOG.warning("Native MAX photo upload failed for job %s; retrying image as File", job["id"])
-                    photo_fallback = True
-                    try:
-                        response = await asyncio.wait_for(self.client.send_message(
-                            chat_id=int(job["route"]), text=data.get("text") or "",
-                            attachments=build_attachments(photo_as_file=True) or None), 300)
-                    except Exception as retry_exc:
-                        if self.upload_error_cls and isinstance(retry_exc, self.upload_error_cls):
-                            raise Retry("MAX attachment upload failed before message send", 30) from retry_exc
-                        raise Uncertain(
-                            f"MAX send result unknown ({type(retry_exc).__name__}); check before forced retry") from retry_exc
-                else:
-                    raise Retry("MAX attachment upload failed before message send", 30) from exc
-            else:
-                # Other SDK failures can happen after the message frame was sent.
-                raise Uncertain(f"MAX send result unknown ({type(exc).__name__}); check before forced retry") from exc
+                raise Retry("MAX attachment upload failed before message send", 30) from exc
+            raise Uncertain(f"MAX send result unknown ({type(exc).__name__}); check before forced retry") from exc
         mid = get(response, "id")
         if mid is None:
             raise Uncertain("MAX returned no message ID")
 
         def finish(c):
-            self.store.finish_in_tx(c, job, {"id": str(mid), "photo_file_fallback": photo_fallback})
+            self.store.finish_in_tx(c, job, {"id": str(mid)})
+            c.execute("INSERT INTO tm_seen(key,expires) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET expires=MAX(expires,excluded.expires)",
+                      (f"selfsent:{job['route']}:{mid}", time.time() + self.cfg.dedup_days * 86400))
             parent = origin.get("parent")
             if parent:
-                remaining = c.execute("SELECT COUNT(*) FROM tm_jobs WHERE kind='to_max' AND key LIKE ? AND state!='done'", (parent + "/%",)).fetchone()[0]
+                remaining = c.execute("SELECT COUNT(*) FROM tm_jobs WHERE kind='to_max' AND key LIKE ? AND state!='done'",
+                                      (parent + "/%",)).fetchone()[0]
                 if not remaining:
-                    self.store.insert(c, f"ack:{parent}", "reaction", f"ack:{origin['message_id']}", {"message_id": origin["message_id"]})
+                    self.store.insert(c, f"ack:{parent}", "reaction", f"ack:{origin['message_id']}",
+                                      {"message_id": origin["message_id"]})
         await self.store.tx(finish)
         await self.store.set_meta("max_delivered", time.time())
 
@@ -2118,6 +2363,7 @@ class Bridge:
                 c.execute("INSERT OR IGNORE INTO tm_routes(max_id,name,type) VALUES(?,?,'private')", (target, title))
                 if requested_thread:
                     c.execute("UPDATE tm_routes SET thread_id=?,state='ready' WHERE max_id=?", (requested_thread, target))
+                    c.execute("DELETE FROM tm_meta WHERE key=?", (f"unbound_notice:{requested_thread}",))
             await self.store.tx(register)
         # ensure_topic serializes external creation and persists ambiguous results.
         dest_thread = await self.ensure_topic(target)
@@ -2153,10 +2399,10 @@ class Bridge:
                       ("mute:" + target, jdump(policy)))
             count = 0
             if muted:
-                # Pending forwards and preprocessing are suppressed, not deferred.
+                # Pending normal forwards to the base Telegram topic are suppressed, not deferred.
                 # An external request already in phase=send cannot be recalled.
                 count = c.execute("UPDATE tm_jobs SET state='cancelled',phase='',error='',result=?,updated=? "
-                    "WHERE route=? AND kind IN ('max_in','to_tg') AND "
+                    "WHERE route=? AND kind='to_tg' AND "
                     "(state='pending' OR (state='running' AND phase!='send'))",
                     (jdump({"suppressed": "muted"}), time.time(), target)).rowcount
             reply = (f"{'🔇' if muted else '🔔'} {name} · topic {topic} · MAX chat {target}\n" +
@@ -2202,7 +2448,12 @@ class Bridge:
             stamp, stamp_label = display_time(source["created"]), "Принято мостом (исходное время неизвестно)"
         name = str(route.get("name") or ctx.get("recipient") or chat_request.get("name") or target)[:180]
         thread = route.get("thread_id") or (body.get("message") or {}).get("message_thread_id")
-        if row["kind"] in {"max_in", "to_tg"}:
+        if row["kind"] == "mirror_tg":
+            recipient = (f"Telegram mirror chat {data.get('tg_chat_id')}"
+                         + (f"; topic {data.get('tg_thread_id')}" if data.get('tg_thread_id') else ""))
+        elif row["kind"] == "mirror_max":
+            recipient = f"MAX mirror chat {row['route']} (source MAX chat {data.get('source_chat_id')})"
+        elif row["kind"] in {"max_in", "to_tg"}:
             recipient = f"{name} → Telegram topic {thread or 'не создан'} (MAX chat {row['route']})"
         elif row["kind"] in {"tg_in", "to_max"}:
             recipient = f"{name} (MAX chat {target}; Telegram topic {thread or 'General'})"
@@ -2390,6 +2641,7 @@ class Bridge:
                     if taken and taken[0] != str(target):
                         raise Permanent("Topic already belongs to another MAX chat; choose a different topic")
                     c.execute("INSERT INTO tm_routes(max_id,thread_id,name,state) VALUES(?,?,?,'ready') ON CONFLICT(max_id) DO UPDATE SET thread_id=excluded.thread_id,state='ready'", (str(target), thread, f"MAX {target}"))
+                    c.execute("DELETE FROM tm_meta WHERE key=?", (f"unbound_notice:{thread}",))
                     for i, (k, r, p) in enumerate(self.notice_specs(f"Топик привязан к MAX-чату {target}. Задачи DLQ можно повторить отдельно.", thread)):
                         self.store.insert(c, f"{job['key']}/notice/{i}", k, r, p)
                     self.store.finish_in_tx(c, job)
@@ -2574,6 +2826,7 @@ class Bridge:
                 lines.append("Проверка PyMax: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(checked))))
         else:
             lines.append(f"PyMax SDK: {SDK_VERSION}; обновления ещё не проверялись")
+        lines.append(f"Mirror rules: {len(self.cfg.mirror_rules)}")
         lines.append(f"Inbox: {self.inbox.usage // 1024} KiB; неперсистентных callback: {self.inbox.waiting}")
         if self.inbox.last_error or self.store.db_error:
             lines.append("ВНИМАНИЕ: хранилище недоступно, проверьте диск/права; см. журнал.")
@@ -2612,7 +2865,7 @@ class Bridge:
 
     async def worker(self, job_kind: str):
         while not self.stop.is_set():
-            if job_kind in {"max_in", "to_max"} and not self.max_ready.is_set():
+            if job_kind in {"max_in", "to_max", "mirror_max"} and not self.max_ready.is_set():
                 await asyncio.sleep(1)
                 continue
             try:
@@ -2635,6 +2888,10 @@ class Bridge:
                     await self.send_tg(job, data)
                 elif job_kind == "to_max":
                     await self.send_max(job, data)
+                elif job_kind == "mirror_max":
+                    await self.send_mirror_max(job, data)
+                elif job_kind == "mirror_tg":
+                    await self.send_mirror_tg(job, data)
                 elif job_kind == "command":
                     await self.execute_command(job, data)
                 else:
@@ -2819,8 +3076,9 @@ class Bridge:
                  "health": self.health(), "watchdog": self.watchdog(), "maintenance": self.maintenance(),
                  "update-monitor": self.update_monitor(),
                  "inbox": self.inbox_worker(), "storage-health": self.storage_health()}
-        for name in ("max_in", "tg_in", "to_tg", "to_max", "command", "notice", "reaction", "edit_topic", "edit_status"):
-            count = self.cfg.workers if name in {"max_in", "to_tg", "to_max"} else 1
+        for name in ("max_in", "tg_in", "to_tg", "to_max", "mirror_max", "mirror_tg",
+                     "command", "notice", "reaction", "edit_topic", "edit_status"):
+            count = self.cfg.workers if name in {"max_in", "to_tg", "to_max", "mirror_max", "mirror_tg"} else 1
             for index in range(count):
                 coros[f"{name}-{index}"] = self.worker(name)
         tasks = [asyncio.create_task(coro, name=name) for name, coro in coros.items()]
@@ -2873,6 +3131,59 @@ def systemd_notify(message: str):
         LOG.warning("systemd notification failed")
 
 
+def install_pymax_photo_compat() -> None:
+    """Fix native Photo upload for PyMax 2.4.1 when MAX omits ?photoIds=.
+
+    PyMax requests one photo but 2.4.1 tries to identify it from the upload URL
+    before uploading. MAX now sometimes returns a valid URL without that query
+    parameter. The upload response itself contains the one photo token needed for
+    a native PHOTO attachment, so use that response instead.
+    """
+    import aiohttp
+    from pymax.api.response import payload_item
+    from pymax.api.uploads.payloads import AttachPhotoPayload, UploadPayload
+    from pymax.api.uploads.service import UploadService
+    from pymax.exceptions import UploadError
+    from pymax.protocol import Opcode
+
+    if getattr(UploadService.upload_photo, "_telemax_compat", False):
+        return
+
+    async def upload_photo_compat(self, photo, profile: bool = False):
+        try:
+            data = await self.app.invoke(Opcode.PHOTO_UPLOAD, UploadPayload(profile=profile).to_payload())
+            url = payload_item(data, "url", str)
+            if not url:
+                raise UploadError("No photo upload URL received")
+            photo_data = photo.validate_photo()
+            if not photo_data:
+                raise UploadError("Photo validation failed")
+            photo_bytes = await photo.read()
+            form = aiohttp.FormData()
+            form.add_field("file", photo_bytes, filename=f"image.{quote(photo_data[0])}",
+                           content_type=photo_data[1])
+            async with aiohttp.ClientSession(proxy=self.app.config.proxy) as session:
+                async with session.post(url=url, data=form) as response:
+                    if response.status != 200:
+                        raise UploadError(f"Photo upload failed with status {response.status}")
+                    result = await response.json(content_type=None)
+            photos = result.get("photos") if isinstance(result, dict) else None
+            if not isinstance(photos, dict) or len(photos) != 1:
+                raise UploadError("Unexpected photo upload response")
+            item = next(iter(photos.values()))
+            token = item.get("token") if isinstance(item, dict) else get(item, "token")
+            if not token:
+                raise UploadError("Photo upload response has no token")
+            return AttachPhotoPayload(photo_token=str(token))
+        except UploadError:
+            raise
+        except Exception as exc:
+            raise UploadError(f"Native photo upload failed ({type(exc).__name__})") from exc
+
+    upload_photo_compat._telemax_compat = True
+    UploadService.upload_photo = upload_photo_compat
+
+
 def load_sdk():
     try:
         installed = importlib.metadata.version("maxapi-python")
@@ -2882,6 +3193,7 @@ def load_sdk():
         raise RuntimeError(f"Expected maxapi-python=={SDK_VERSION}; installed: {installed}")
     from pymax import Client, File, Photo, UploadError, Video, VideoNote, Voice
     from pymax.config import ExtraConfig
+    install_pymax_photo_compat()
     return Client, ExtraConfig, {"document": File, "photo": Photo, "video": Video,
                                 "voice": Voice, "video_note": VideoNote}, UploadError
 

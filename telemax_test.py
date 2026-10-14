@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.3 regression tests. Run: python -m unittest -v telemax_test.
+"""Telemax 3.5.5 regression tests. Run: python -m unittest -v telemax_test.
 
 The core suite uses temporary SQLite databases, mocked external APIs and loopback
 HTTP only. No MAX or Telegram credentials are read. Optional SDK contract tests
@@ -177,6 +177,7 @@ class BridgeFixture(unittest.IsolatedAsyncioTestCase):
         self.client = NS(get_user=AsyncMock(return_value=NS(first_name="Name", last_name="")),
                          get_chat=AsyncMock(return_value=NS(title="Group", type="CHAT")),
                          send_message=AsyncMock(return_value=NS(id=900)),
+                         forward_message=AsyncMock(return_value=NS(id=901)),
                          get_file_by_id=AsyncMock(return_value=NS(url="https://cdn.example.test/file")),
                          fetch_users=AsyncMock(return_value=[]))
         self.bridge = Bridge(self.cfg, self.store, self.client,
@@ -517,7 +518,7 @@ class FreshStateTests(unittest.TestCase):
         with sqlite_connection(self.root / "telegram_queue.db") as conn:
             meta = dict(conn.execute("SELECT key,value FROM tm_meta"))
             self.assertEqual(meta["schema"], app.SCHEMA_VERSION)
-            self.assertEqual(meta["created_by"], "3.5.3")
+            self.assertEqual(meta["created_by"], "3.5.5")
             self.assertEqual(meta["tg_bot_id"], "123")
             self.assertEqual(meta["tg_chat_id"], "-100")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tm_jobs").fetchone()[0], 0)
@@ -635,7 +636,7 @@ class FreshStateTests(unittest.TestCase):
                                 cwd=self.root, env={**os.environ, "PYTHONPATH": str(Path(app.__file__).parent)},
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "3.5.3")
+        self.assertEqual(result.stdout.strip(), "3.5.5")
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_cli_init_is_offline_and_repeated_init_fails(self):
@@ -655,7 +656,7 @@ class FreshStateTests(unittest.TestCase):
         result = subprocess.run([sys.executable, app.__file__, "--version"], cwd=self.root,
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "Telemax 3.5.3")
+        self.assertEqual(result.stdout.strip(), "Telemax 3.5.5")
 
 
 class Config350Tests(unittest.TestCase):
@@ -1052,6 +1053,11 @@ class InstalledSDKTests(unittest.TestCase):
         self.assertIsNone(config(proxy=None).proxy)
         self.assertTrue(callable(client))
 
+    def test_photo_upload_compat_patch_is_installed(self):
+        app.load_sdk()
+        from pymax.api.uploads.service import UploadService
+        self.assertTrue(getattr(UploadService.upload_photo, "_telemax_compat", False))
+
     def test_message_service_signature(self):
         app.load_sdk()
         from pymax.api.messages.service import MessageService
@@ -1335,10 +1341,11 @@ class Release351Tests(BridgeFixture):
         self.assertEqual((await self.store.read("SELECT state FROM tm_jobs WHERE key='waiting'"))[0]["state"], "cancelled")
         await self.bridge.on_message({"id": 2, "chat_id": 100, "sender": 2, "text": "while muted"})
         await self.bridge.import_inbox_once()
-        self.assertIsNone(await self.store.claim("max_in"))
-        row = (await self.store.read("SELECT * FROM tm_jobs WHERE key='max:100:2'"))[0]
-        self.assertEqual(row["state"], "cancelled")
-        self.assertEqual(json.loads(row["result"])["suppressed"], "muted")
+        row = await self.store.claim("max_in")
+        self.assertIsNotNone(row)  # preprocessing still runs so independent mirror rules can fan out
+        await self.bridge.prepare_max(row, json.loads(row["payload"]))
+        self.assertEqual((await self.state(row))["state"], "done")
+        self.assertFalse(await self.store.read("SELECT * FROM tm_jobs WHERE key LIKE 'max:100:2/%'"))
 
     async def test_unmute_does_not_replay_muted_messages(self):
         await self.command("/mute")
@@ -1346,7 +1353,9 @@ class Release351Tests(BridgeFixture):
         await self.bridge.import_inbox_once()
         await self.command("/unmute")
         self.assertFalse(await self.store.muted("100"))
-        self.assertIsNone(await self.store.claim("max_in"))
+        old = await self.store.claim("max_in")
+        await self.bridge.prepare_max(old, json.loads(old["payload"]))
+        self.assertFalse(await self.store.read("SELECT * FROM tm_jobs WHERE key LIKE 'max:100:3/%'"))
         await self.bridge.on_message({"id": 4, "chat_id": 100, "sender": 2, "text": "new"})
         await self.bridge.import_inbox_once()
         row = await self.store.claim("max_in")
@@ -1379,9 +1388,12 @@ class Release351Tests(BridgeFixture):
         data = {"id": 6, "chat_id": 100, "sender": 2, "text": "hello"}
         row = await self.job("max_in", data)
         await self.command("/mute")
-        await self.store.expand(row, [("to_tg", "100", {"text": "hello"})])
-        self.assertEqual((await self.state(row))["state"], "cancelled")
-        self.assertFalse(await self.store.read("SELECT * FROM tm_jobs WHERE kind='to_tg'"))
+        await self.store.expand(row, [("to_tg", "100", {"text": "hello", "received_at": time.time()})])
+        self.assertEqual((await self.state(row))["state"], "done")
+        child = await self.store.claim("to_tg")
+        await self.bridge.send_tg(child, json.loads(child["payload"]))
+        self.assertEqual((await self.state(child))["state"], "cancelled")
+        self.bridge.tg.call.assert_not_awaited()
 
     async def test_mute_while_waiting_to_send_prevents_network_call(self):
         data = {"text": "test", "files": []}
@@ -1560,6 +1572,11 @@ class Release351SDKTests(unittest.TestCase):
         self.assertIn("user_id", inspect.signature(Client.get_user).parameters)
         from pymax.api.users.service import UserService
         self.assertEqual(UserService(NS()).get_chat_id(1, 44), 45)
+
+    def test_native_forward_message_signature_for_mirror(self):
+        Client, _, _, _ = app.load_sdk()
+        params = inspect.signature(Client.forward_message).parameters
+        self.assertTrue({"chat_id", "message_id", "source_chat_id"} <= set(params))
 
     def test_real_control_model_full_snapshot(self):
         app.load_sdk()
@@ -1793,8 +1810,10 @@ class Release352Tests(BridgeFixture):
         await self.bridge.on_message({'id': 607, 'chat_id': 100, 'sender': 2, 'text': 'muted'})
         await self.command('/unmute')
         await self.bridge.import_inbox_once()
-        row = (await self.store.read("SELECT * FROM tm_jobs WHERE key='max:100:607'"))[0]
-        self.assertEqual(row['state'], 'cancelled')
+        row = await self.store.claim('max_in')
+        await self.bridge.prepare_max(row, json.loads(row['payload']))
+        self.assertEqual((await self.state(row))['state'], 'done')
+        self.assertFalse(await self.store.read("SELECT * FROM tm_jobs WHERE key LIKE 'max:100:607/%'"))
 
     async def test_recoverable_sqlite_write_error_retries_not_external_send(self):
         original = self.store.finish_in_tx
@@ -2205,6 +2224,69 @@ class Release353UnitTests(unittest.TestCase):
         self.assertIn("новая major-версия", major_reasons)
 
 
+class Release354UnitTests(unittest.TestCase):
+    def test_system_events_are_silent(self):
+        self.assertTrue(app.silent_max_event({"action": "add", "files": []}))
+        self.assertTrue(app.silent_max_event({"type": "ADD", "files": []}))
+        self.assertTrue(app.silent_max_event({"type": "MESSAGE", "files": [{"type": "CONTROL"}]}))
+        self.assertFalse(app.silent_max_event({"type": "MESSAGE", "files": [], "text": "hello"}))
+
+
+class Release354Tests(BridgeFixture):
+    async def test_system_event_sets_disable_notification(self):
+        data = {"id": 801, "chat_id": 100, "sender": 2, "text": "", "type": "ADD",
+                "time": int(time.time() * 1000), "files": []}
+        parent = await self.job("max_in", data, key="max:100:801")
+        await self.bridge.prepare_max(parent, data)
+        child = await self.store.claim("to_tg")
+        payload = json.loads(child["payload"])
+        self.assertTrue(payload["silent"])
+        await self.bridge.send_tg(child, payload)
+        params = self.bridge.tg.call.call_args.args[1]
+        self.assertTrue(params["disable_notification"])
+
+    async def test_unbound_topic_notice_is_sent_only_once_and_resets_after_bind(self):
+        await self.store.tx(lambda c: c.execute("DELETE FROM tm_routes WHERE thread_id=42"))
+        first_data = {"message": self.tgmsg("first"), "target": None}
+        first = await self.job("tg_in", first_data, route="thread:42", key="tg:first")
+        await self.bridge.prepare_tg(first, first_data)
+        notices = await self.store.read("SELECT * FROM tm_jobs WHERE kind='notice'")
+        self.assertEqual(len(notices), 1)
+
+        second_data = {"message": self.tgmsg("second"), "target": None}
+        second = await self.job("tg_in", second_data, route="thread:42", key="tg:second")
+        await self.bridge.prepare_tg(second, second_data)
+        self.assertEqual(len(await self.store.read("SELECT * FROM tm_jobs WHERE kind='notice'")), 1)
+
+        command = {"message": self.tgmsg("/bind 100")}
+        bind_job = await self.job("command", command, route="thread:42", key="tg:bind")
+        await self.bridge.execute_command(bind_job, command)
+        self.assertEqual(await self.store.meta("unbound_notice:42", ""), "")
+
+    async def test_own_max_message_can_be_forwarded_when_enabled(self):
+        self.bridge.cfg = dataclasses.replace(self.cfg, forward_own_max_messages=True)
+        data = {"id": 9001, "chat_id": 100, "sender": 1, "text": "sent elsewhere",
+                "type": "MESSAGE", "time": int(time.time() * 1000), "files": []}
+        job = await self.job("max_in", data, key="max:100:9001")
+        job["created"] = time.time() - 10
+        await self.bridge.prepare_max(job, data)
+        child = await self.store.claim("to_tg")
+        self.assertIsNotNone(child)
+        self.assertIn("sent elsewhere", json.loads(child["payload"])["text"])
+
+    async def test_telemax_originated_max_message_is_suppressed_by_exact_id(self):
+        self.bridge.cfg = dataclasses.replace(self.cfg, forward_own_max_messages=True)
+        await self.store.tx(lambda c: c.execute(
+            "INSERT INTO tm_seen(key,expires) VALUES(?,?)", ("selfsent:100:9002", time.time() + 60)))
+        data = {"id": 9002, "chat_id": 100, "sender": 1, "text": "echo",
+                "type": "MESSAGE", "time": int(time.time() * 1000), "files": []}
+        job = await self.job("max_in", data, key="max:100:9002")
+        await self.bridge.prepare_max(job, data)
+        state = await self.state(job)
+        self.assertEqual(state["state"], "done")
+        self.assertFalse(await self.store.read("SELECT 1 FROM tm_jobs WHERE kind='to_tg' AND state='pending'"))
+
+
 class Release353Tests(BridgeFixture):
     async def test_top_level_add_event_is_human_readable(self):
         data = {"id": 701, "chat_id": 100, "sender": 2, "text": "", "type": "add",
@@ -2258,7 +2340,7 @@ class Release353Tests(BridgeFixture):
         self.bridge.tg.call.assert_awaited_once()
         self.assertEqual(self.bridge.tg.call.call_args.args[0], "editMessageText")
 
-    async def test_telegram_photo_upload_error_falls_back_to_file(self):
+    async def test_telegram_photo_upload_error_retries_native_photo_without_file_fallback(self):
         class FakeUploadError(Exception):
             pass
         class PhotoAttachment(Attachment):
@@ -2275,16 +2357,13 @@ class Release353Tests(BridgeFixture):
                 "path": str(path), "name": "telegram-photo.jpg"}],
                 "origin": {"sender": 7, "parent": "tg:photo", "message_id": 77}}
         job = await self.job("to_max", data, key="tg:photo/0")
-        self.client.send_message.side_effect = [FakeUploadError("native photo upload failed"), NS(id=901)]
-        await self.bridge.send_max(job, data)
-        self.assertEqual(self.client.send_message.await_count, 2)
-        first = self.client.send_message.await_args_list[0].kwargs["attachments"][0]
-        second = self.client.send_message.await_args_list[1].kwargs["attachments"][0]
-        self.assertIsInstance(first, PhotoAttachment)
-        self.assertIsInstance(second, FileAttachment)
-        state = await self.state(job)
-        self.assertEqual(state["state"], "done")
-        self.assertTrue(json.loads(state["result"])["photo_file_fallback"])
+        self.client.send_message.side_effect = FakeUploadError("native photo upload failed")
+        with self.assertRaises(Retry):
+            await self.bridge.send_max(job, data)
+        self.client.send_message.assert_awaited_once()
+        attachment = self.client.send_message.await_args.kwargs["attachments"][0]
+        self.assertIsInstance(attachment, PhotoAttachment)
+        self.assertNotIsInstance(attachment, FileAttachment)
 
     async def test_non_photo_upload_error_is_retryable_not_uncertain(self):
         class FakeUploadError(Exception):
@@ -2349,3 +2428,122 @@ class Config352Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class Mirror355Tests(BridgeFixture):
+    def mirror_rule(self, **kwargs):
+        values = dict(source_max_chat_id=100, target_max_chat_id=200,
+                      target_tg_chat_id=-100999, target_tg_thread_id=321,
+                      normal_forward=True, include_own_messages=False,
+                      forward_system_events=False, silent_tg=True)
+        values.update(kwargs)
+        return app.MirrorRule(**values)
+
+    def test_mirror_config_supports_external_forum_topic(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "constants.json"
+            path.write_text(jdump({
+                "MAX_PHONE": "+70000000000", "TG_BOT_TOKEN": "123:x", "TG_CHAT_ID": -100,
+                "MIRROR_RULES": [{
+                    "SOURCE_MAX_CHAT_ID": 100,
+                    "TARGET_MAX_CHAT_ID": 200,
+                    "TARGET_TG_CHAT_ID": -100999,
+                    "TARGET_TG_THREAD_ID": 321,
+                    "NORMAL_FORWARD": False,
+                    "INCLUDE_OWN_MESSAGES": True,
+                    "FORWARD_SYSTEM_EVENTS": True,
+                    "SILENT_TG": False,
+                }]
+            }))
+            cfg = Config.load(path)
+            self.assertEqual(len(cfg.mirror_rules), 1)
+            rule = cfg.mirror_rules[0]
+            self.assertEqual(rule.source_max_chat_id, 100)
+            self.assertEqual(rule.target_max_chat_id, 200)
+            self.assertEqual(rule.target_tg_chat_id, -100999)
+            self.assertEqual(rule.target_tg_thread_id, 321)
+            self.assertFalse(rule.normal_forward)
+            self.assertTrue(rule.include_own_messages)
+            self.assertTrue(rule.forward_system_events)
+            self.assertFalse(rule.silent_tg)
+
+    def test_mirror_config_rejects_thread_without_chat(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "constants.json"
+            path.write_text(jdump({
+                "MAX_PHONE": "+70000000000", "TG_BOT_TOKEN": "123:x", "TG_CHAT_ID": -100,
+                "MIRROR_RULES": [{"SOURCE_MAX_CHAT_ID": 100, "TARGET_TG_THREAD_ID": 321,
+                                  "TARGET_MAX_CHAT_ID": 200}]
+            }))
+            with self.assertRaises(ValueError):
+                Config.load(path)
+
+    async def test_prepare_max_creates_three_independent_fanout_jobs(self):
+        rule = self.mirror_rule()
+        self.bridge.cfg = dataclasses.replace(self.cfg, mirror_rules=(rule,))
+        data = {"id": 50, "chat_id": 100, "sender": 2, "text": "hello", "type": "MESSAGE",
+                "time": 1000, "files": [], "received_at": time.time()}
+        job = await self.job("max_in", data, key="max:100:50")
+        await self.bridge.prepare_max(job, data)
+        rows = await self.store.read("SELECT kind,route,payload FROM tm_jobs WHERE key LIKE 'max:100:50/%' ORDER BY id")
+        self.assertEqual([r["kind"] for r in rows], ["to_tg", "mirror_max", "mirror_tg"])
+        self.assertEqual(rows[1]["route"], "200")
+        max_payload = json.loads(rows[1]["payload"])
+        self.assertEqual(max_payload["source_chat_id"], 100)
+        self.assertEqual(max_payload["source_message_id"], 50)
+        tg_payload = json.loads(rows[2]["payload"])
+        self.assertEqual(tg_payload["tg_chat_id"], -100999)
+        self.assertEqual(tg_payload["tg_thread_id"], 321)
+        self.assertTrue(tg_payload["silent"])
+
+    async def test_external_telegram_topic_receives_thread_id(self):
+        data = {"text": "mirror", "files": [], "tg_chat_id": -100999,
+                "tg_thread_id": 321, "silent": True}
+        job = await self.job("mirror_tg", data, route="mirror-tg:-100999:321")
+        await self.bridge.send_mirror_tg(job, data)
+        method, params = self.bridge.tg.call.call_args.args[:2]
+        self.assertEqual(method, "sendMessage")
+        self.assertEqual(params["chat_id"], -100999)
+        self.assertEqual(params["message_thread_id"], 321)
+        self.assertTrue(params["disable_notification"])
+        self.assertEqual((await self.state(job))["state"], "done")
+
+    async def test_mirror_max_uses_native_forward_and_marks_echo(self):
+        data = {"source_chat_id": 100, "source_message_id": 50, "source_key": "max:100:50"}
+        job = await self.job("mirror_max", data, route="200")
+        await self.bridge.send_mirror_max(job, data)
+        self.client.forward_message.assert_awaited_once_with(
+            chat_id=200, message_id=50, source_chat_id=100)
+        self.assertTrue(await self.store.seen("selfsent:200:901"))
+        self.assertEqual((await self.state(job))["state"], "done")
+
+    async def test_system_event_is_not_mirrored_by_default(self):
+        self.bridge.cfg = dataclasses.replace(self.cfg, mirror_rules=(self.mirror_rule(),))
+        data = {"id": 51, "chat_id": 100, "sender": 2, "text": "", "type": "ADD",
+                "action": "add", "time": 1000, "files": [], "received_at": time.time()}
+        job = await self.job("max_in", data, key="max:100:51")
+        await self.bridge.prepare_max(job, data)
+        rows = await self.store.read("SELECT kind,payload FROM tm_jobs WHERE key LIKE 'max:100:51/%' ORDER BY id")
+        self.assertEqual([r["kind"] for r in rows], ["to_tg"])
+        self.assertTrue(json.loads(rows[0]["payload"])["silent"])
+
+    async def test_mute_suppresses_base_topic_but_not_mirror(self):
+        self.bridge.cfg = dataclasses.replace(self.cfg, mirror_rules=(self.mirror_rule(),))
+        await self.store.set_meta("mute:100", jdump({"muted": True, "discard_before": 0}))
+        data = {"id": 52, "chat_id": 100, "sender": 2, "text": "mirror while muted",
+                "type": "MESSAGE", "time": 1000, "files": [], "received_at": time.time()}
+        job = await self.job("max_in", data, key="max:100:52")
+        await self.bridge.prepare_max(job, data)
+        rows = await self.store.read("SELECT kind FROM tm_jobs WHERE key LIKE 'max:100:52/%' ORDER BY id")
+        self.assertEqual([r["kind"] for r in rows], ["mirror_max", "mirror_tg"])
+
+    async def test_own_message_can_be_mirrored_without_global_own_forwarding(self):
+        rule = self.mirror_rule(normal_forward=False, include_own_messages=True)
+        self.bridge.cfg = dataclasses.replace(self.cfg, forward_own_max_messages=False,
+                                              mirror_rules=(rule,))
+        data = {"id": 53, "chat_id": 100, "sender": 1, "text": "sent from phone",
+                "type": "MESSAGE", "time": 1000, "files": [], "received_at": time.time()}
+        job = await self.job("max_in", data, key="max:100:53")
+        await self.bridge.prepare_max(job, data)
+        rows = await self.store.read("SELECT kind FROM tm_jobs WHERE key LIKE 'max:100:53/%' ORDER BY id")
+        self.assertEqual([r["kind"] for r in rows], ["mirror_max", "mirror_tg"])
+
