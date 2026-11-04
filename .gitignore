@@ -1,0 +1,42 @@
+# Local configuration and secrets
+/constants.json
+/.env
+/.env.*
+*.pem
+*.key
+*.p12
+
+# Database, session and runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/session_cache/
+/media_queue/
+/inbox/
+/dumps/
+/backups/
+/import/
+/.telemax.lock
+
+# Logs and diagnostic files
+*.log
+*.log.*
+*.bak
+*.bak.*
+*.tmp
+*.part
+
+# Python environment and build artifacts
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
