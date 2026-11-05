@@ -1,13 +1,13 @@
-# Telemax 3.5.5 — установка и обновление
+# Telemax 3.5.6 — установка и обновление
 
 Комплект: `telemax.py`, `telemax_test.py`, этот `deployment.md`. Python 3.10+,
-Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запуске не устанавливаются.
-Версия приложения **3.5.5**, формат БД **351** — разные номера: формат не меняется
+Linux, `curl`, **maxapi-python==2.5.0**. Зависимости при запуске не устанавливаются.
+Версия приложения **3.5.6**, формат БД **351** — разные номера: формат не меняется
 просто из-за нового номера релиза.
 
-## Быстрое обновление с 3.5.4
+## Быстрое обновление с 3.5.5
 
-Формат БД в 3.5.5 остаётся **351**, поэтому для уже работающей 3.5.4 миграция не нужна.
+Формат БД в 3.5.6 остаётся **351**, поэтому для уже работающей 3.5.5 миграция не нужна.
 Остановите сервис, сделайте backup `telemax.py` и SQLite, замените `telemax.py` и
 `telemax_test.py`, выполните `--check`/тесты и запустите сервис. `constants.json`
 можно оставить без изменений: новый `MIRROR_RULES` необязателен и по умолчанию пуст.
@@ -15,8 +15,11 @@ Linux, `curl`, **maxapi-python==2.4.1**. Зависимости при запу�
 ```bash
 cd /home/htpc/telemax
 sudo systemctl stop telemax.service
-cp -p telemax.py "telemax.py.pre-3.5.5.$(date +%Y%m%d-%H%M%S)"
-sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.5.bak'"
+cp -p telemax.py "telemax.py.pre-3.5.6.$(date +%Y%m%d-%H%M%S)"
+sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.6.bak'"
+./venv/bin/python -m pip freeze > requirements.pre-3.5.6.txt
+./venv/bin/python -m pip install --proxy socks5h://127.0.0.1:10808 "maxapi-python==2.5.0"
+./venv/bin/python -m pip check
 cp /path/to/release/telemax.py /path/to/release/telemax_test.py .
 ./venv/bin/python telemax.py --check
 ./venv/bin/python -m unittest -v telemax_test
@@ -46,7 +49,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 
 `--upgrade-db` — встроенная офлайн-команда приложения, **не отдельный скрипт**.
 Она проверяет структуру и привязку к Telegram, создаёт проверенную SQLite-копию
-в `backups/pre-3.5.5-<время>-<суффикс>/`, затем одной транзакцией добавляет
+в `backups/pre-3.5.6-<время>-<суффикс>/`, затем одной транзакцией добавляет
 `tm_seen`, индекс срока хранения и поле `tm_jobs.retry_since`. Старые задачи,
 маршруты и смещение не переписываются. Архивные `queue_v2`, `queue_dead_letter`
 и другие старые таблицы остаются на месте, **но никогда не импортируются снова**.
@@ -58,7 +61,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 
 ### Порядок действий
 
-Распакуйте ZIP в `/home/htpc/telemax/update_3.5.5`, **не поверх работающих файлов**.
+Распакуйте ZIP в `/home/htpc/telemax/update_3.5.6`, **не поверх работающих файлов**.
 Все команды Python, тесты и операции с рабочими файлами выполняйте от `htpc`.
 Используйте Bash. Если каталог или имя сервиса другие, замените их согласованно.
 
@@ -66,7 +69,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 # Выполняйте блок по шагам; намеренно без `set -e`, чтобы ошибка команды
 # не закрыла интерактивную SSH-сессию.
 cd /home/htpc/telemax
-RELEASE="$PWD/update_3.5.5"
+RELEASE="$PWD/update_3.5.6"
 SERVICE=telemax.service
 
 # Проверки нового кода до остановки старого сервиса. Нет входа в MAX/Telegram.
@@ -79,7 +82,7 @@ sudo systemctl stop "$SERVICE"
 # Остановите и вручную запущенные экземпляры. Они используют тот же bot token.
 
 umask 077
-SNAP="$PWD/backups/manual-pre-3.5.5-$(date -u +%Y%m%dT%H%M%SZ)"
+SNAP="$PWD/backups/manual-pre-3.5.6-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -m 700 -p "$SNAP"
 sqlite3 telegram_queue.db ".backup '$SNAP/telegram_queue.db'"
 test "$(sqlite3 "$SNAP/telegram_queue.db" 'PRAGMA quick_check;')" = ok
@@ -133,6 +136,19 @@ sudo journalctl -u "$SERVICE" -n 80 --no-pager
 доставленные сообщения и потерять новые локальные задачи. Сначала сверяйте
 доставки и сохраняйте текущий снимок; автоматического безопасного «отката времени»
 здесь нет. Не удаляйте backup после одного успешного запуска.
+
+## Что изменилось в 3.5.6
+
+- SDK обновлён до **maxapi-python==2.5.0**, схема SQLite **351** не меняется.
+- Удалён старый Telemax monkey-patch PyMax 2.4.1: PyMax 2.5.0 сам умеет
+  загружать нативное фото при upload URL без `photoIds`.
+- Добавлен SDK-тест этой ситуации с реальной логикой PyMax и мокированным HTTP.
+- GitHub Actions workflow для unit/SDK-тестов добавляется отдельно через
+  `.github/workflows/tests.yml` после разрешения workflow-изменений в GitHub.
+- `constants.json`, MAX-сессия, `MIRROR_RULES`, очередь и DLQ не меняются.
+
+Не устанавливайте 3.5.6 на production до успешного CI и ручного smoke-test
+текста, фотографий и пересылки MAX → MAX на тестовых чатах.
 
 ## Что изменилось в 3.5.5
 
@@ -542,7 +558,7 @@ sudo systemctl start telemax.service
 ## Чистая установка — только если установки действительно ещё нет
 
 Не используйте этот раздел вместо обновления существующей БД.
-Пример нового каталога: `/home/htpc/telemax-3.5.5`, пользователь `htpc`.
+Пример нового каталога: `/home/htpc/telemax-3.5.6`, пользователь `htpc`.
 
 1. Нужны Python 3.10+, venv, `curl`, CA certificates, а для приведённых команд —
    `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:10808`
@@ -553,11 +569,11 @@ sudo systemctl start telemax.service
 ```bash
 # Выполняйте команды по одной; без `set -e`, чтобы ошибка не закрыла SSH shell.
 umask 077
-mkdir -p /home/htpc/telemax-3.5.5
-cd /home/htpc/telemax-3.5.5
+mkdir -p /home/htpc/telemax-3.5.6
+cd /home/htpc/telemax-3.5.6
 python3 -c 'import sys; assert sys.version_info >= (3,10)'
 python3 -m venv venv
-./venv/bin/python -m pip install 'maxapi-python==2.4.1'
+./venv/bin/python -m pip install 'maxapi-python==2.5.0'
 ./venv/bin/python -m pip check
 ./venv/bin/python -m pip freeze > requirements.installed.txt
 chmod 600 constants.json
@@ -596,8 +612,8 @@ After=network-online.target
 Type=notify
 User=htpc
 Group=htpc
-WorkingDirectory=/home/htpc/telemax-3.5.5
-ExecStart=/home/htpc/telemax-3.5.5/venv/bin/python /home/htpc/telemax-3.5.5/telemax.py
+WorkingDirectory=/home/htpc/telemax-3.5.6
+ExecStart=/home/htpc/telemax-3.5.6/venv/bin/python /home/htpc/telemax-3.5.6/telemax.py
 Restart=on-failure
 RestartSec=10
 WatchdogSec=30
@@ -667,7 +683,7 @@ sudo journalctl -u telemax.service -n 80 --no-pager
 ## Проверки перед доверием переписке
 
 Тесты используют временные БД, заглушки API и локальный HTTP-сервер для curl.
-Дополнительные контрактные тесты требуют установленного SDK 2.4.1; без него они
+Дополнительные контрактные тесты требуют установленного SDK 2.5.0; без него они
 явно пропускаются. Наличие успешных локальных тестов **не означает** проверку
 живых аккаунтов. Проверьте вручную текст/файл в обе стороны, SHARE/CONTROL,
 повтор старой DLQ, mute и новый личный чат. Не обещается exactly-once доставка.

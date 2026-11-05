@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.5 regression tests. Run: python -m unittest -v telemax_test.
+"""Telemax 3.5.6 regression tests. Run: python -m unittest -v telemax_test.
 
 The core suite uses temporary SQLite databases, mocked external APIs and loopback
 HTTP only. No MAX or Telegram credentials are read. Optional SDK contract tests
-are skipped when maxapi-python==2.4.1 is not installed.
+are skipped when maxapi-python==2.5.0 is not installed.
 """
 from __future__ import annotations
 
@@ -1048,15 +1048,15 @@ except importlib.metadata.PackageNotFoundError:
 class InstalledSDKTests(unittest.TestCase):
     def test_exact_version_and_media_exports(self):
         client, config, media, _ = app.load_sdk()
-        self.assertEqual(importlib.metadata.version("maxapi-python"), "2.4.1")
+        self.assertEqual(importlib.metadata.version("maxapi-python"), "2.5.0")
         self.assertEqual(set(media), {"photo", "video", "document", "voice", "video_note"})
         self.assertIsNone(config(proxy=None).proxy)
         self.assertTrue(callable(client))
 
-    def test_photo_upload_compat_patch_is_installed(self):
+    def test_photo_upload_uses_upstream_implementation(self):
         app.load_sdk()
         from pymax.api.uploads.service import UploadService
-        self.assertTrue(getattr(UploadService.upload_photo, "_telemax_compat", False))
+        self.assertFalse(getattr(UploadService.upload_photo, "_telemax_compat", False))
 
     def test_message_service_signature(self):
         app.load_sdk()
@@ -2547,3 +2547,41 @@ class Mirror355Tests(BridgeFixture):
         rows = await self.store.read("SELECT kind FROM tm_jobs WHERE key LIKE 'max:100:53/%' ORDER BY id")
         self.assertEqual([r["kind"] for r in rows], ["mirror_max", "mirror_tg"])
 
+
+@unittest.skipUnless(SDK_PRESENT, "requires maxapi-python==2.5.0")
+class PyMax250PhotoContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_without_photo_ids_uses_native_photo_token(self):
+        """Execute the actual installed PyMax upload code; replace network calls only."""
+        from pymax.api.uploads.service import UploadService
+
+        class PhotoResponse:
+            status = 200
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return None
+            async def json(self):
+                return {"photos": {"generated-id": {"token": "native-photo-token"}}}
+
+        class Session:
+            def __init__(self, *args, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return None
+            def post(self, *args, **kwargs):
+                return PhotoResponse()
+
+        uploader = object.__new__(UploadService)
+        uploader.app = NS(
+            invoke=AsyncMock(return_value=NS(
+                payload={"url": "https://upload.example.test/photo-without-query"})),
+            config=NS(proxy=None))
+        uploader.ssl_ctx = None
+        photo = NS(
+            validate_photo=lambda: ("jpg", "image/jpeg"),
+            read=AsyncMock(return_value=b"image"))
+        with patch("pymax.api.uploads.service.aiohttp.ClientSession", Session):
+            result = await uploader.upload_photo(photo)
+        self.assertEqual(result.photo_token, "native-photo-token")

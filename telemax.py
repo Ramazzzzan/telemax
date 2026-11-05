@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.5 — MAX <-> Telegram bridge.
+"""Telemax 3.5.6 — MAX <-> Telegram bridge.
 
-Python 3.10+; maxapi-python==2.4.1; curl; Linux.
+Python 3.10+; maxapi-python==2.5.0; curl; Linux.
 Configure constants.json, run --init once, then start normally.
 Existing schema 3 (tm_*) / 350 upgrades in place via --upgrade-db, after stopping
 service and backup. Never reimport legacy queue_v2 rows. Session and routes retained.
@@ -51,10 +51,10 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-VERSION = "3.5.5"
+VERSION = "3.5.6"
 SCHEMA_VERSION = "351"  # Storage format, not application release number.
 UPGRADE_SCHEMAS = {"3", "350"}
-SDK_VERSION = "2.4.1"
+SDK_VERSION = "2.5.0"
 LOG = logging.getLogger("telemax")
 ACTIVE = ("pending", "running", "dead", "uncertain")
 MEDIA_TYPES = {"PHOTO", "VIDEO", "FILE", "AUDIO", "VOICE", "STICKER"}
@@ -3131,58 +3131,6 @@ def systemd_notify(message: str):
         LOG.warning("systemd notification failed")
 
 
-def install_pymax_photo_compat() -> None:
-    """Fix native Photo upload for PyMax 2.4.1 when MAX omits ?photoIds=.
-
-    PyMax requests one photo but 2.4.1 tries to identify it from the upload URL
-    before uploading. MAX now sometimes returns a valid URL without that query
-    parameter. The upload response itself contains the one photo token needed for
-    a native PHOTO attachment, so use that response instead.
-    """
-    import aiohttp
-    from pymax.api.response import payload_item
-    from pymax.api.uploads.payloads import AttachPhotoPayload, UploadPayload
-    from pymax.api.uploads.service import UploadService
-    from pymax.exceptions import UploadError
-    from pymax.protocol import Opcode
-
-    if getattr(UploadService.upload_photo, "_telemax_compat", False):
-        return
-
-    async def upload_photo_compat(self, photo, profile: bool = False):
-        try:
-            data = await self.app.invoke(Opcode.PHOTO_UPLOAD, UploadPayload(profile=profile).to_payload())
-            url = payload_item(data, "url", str)
-            if not url:
-                raise UploadError("No photo upload URL received")
-            photo_data = photo.validate_photo()
-            if not photo_data:
-                raise UploadError("Photo validation failed")
-            photo_bytes = await photo.read()
-            form = aiohttp.FormData()
-            form.add_field("file", photo_bytes, filename=f"image.{quote(photo_data[0])}",
-                           content_type=photo_data[1])
-            async with aiohttp.ClientSession(proxy=self.app.config.proxy) as session:
-                async with session.post(url=url, data=form) as response:
-                    if response.status != 200:
-                        raise UploadError(f"Photo upload failed with status {response.status}")
-                    result = await response.json(content_type=None)
-            photos = result.get("photos") if isinstance(result, dict) else None
-            if not isinstance(photos, dict) or len(photos) != 1:
-                raise UploadError("Unexpected photo upload response")
-            item = next(iter(photos.values()))
-            token = item.get("token") if isinstance(item, dict) else get(item, "token")
-            if not token:
-                raise UploadError("Photo upload response has no token")
-            return AttachPhotoPayload(photo_token=str(token))
-        except UploadError:
-            raise
-        except Exception as exc:
-            raise UploadError(f"Native photo upload failed ({type(exc).__name__})") from exc
-
-    upload_photo_compat._telemax_compat = True
-    UploadService.upload_photo = upload_photo_compat
-
 
 def load_sdk():
     try:
@@ -3193,7 +3141,6 @@ def load_sdk():
         raise RuntimeError(f"Expected maxapi-python=={SDK_VERSION}; installed: {installed}")
     from pymax import Client, File, Photo, UploadError, Video, VideoNote, Voice
     from pymax.config import ExtraConfig
-    install_pymax_photo_compat()
     return Client, ExtraConfig, {"document": File, "photo": Photo, "video": Video,
                                 "voice": Voice, "video_note": VideoNote}, UploadError
 

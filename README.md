@@ -2,9 +2,9 @@
 
 Telemax — self-hosted MAX ↔ Telegram bridge for a personal MAX account, based on [PyMax](https://github.com/MaxApiTeam/PyMax).
 
-Current release: **3.5.5**  
+Current release: **3.5.6**  
 Database schema: **351**  
-Pinned SDK: **maxapi-python==2.4.1**
+Pinned SDK: **maxapi-python==2.5.0**
 
 Telemax mirrors MAX chats into Telegram forum topics, allows replies from Telegram back to MAX, keeps a durable SQLite queue, persists incoming MAX events before queue admission, maintains DLQ diagnostics, and supports additional MAX/Telegram mirror destinations.
 
@@ -22,7 +22,7 @@ Telemax mirrors MAX chats into Telegram forum topics, allows replies from Telegr
 - Best-effort PyMax version monitoring; SDK is never upgraded automatically.
 - Silent Telegram delivery for MAX system events.
 - One-time warning when a Telegram topic is not linked to MAX.
-- Native Telegram-photo → MAX-photo compatibility workaround for PyMax 2.4.1.
+- Native photo upload via upstream PyMax 2.5.0 (no Telemax monkey-patch).
 - Optional forwarding of messages sent by the same MAX account from other MAX clients.
 - Additional per-chat fan-out through `MIRROR_RULES`:
   - MAX → another MAX chat using native forward;
@@ -40,7 +40,7 @@ Telemax does **not** guarantee exactly-once delivery. If an external API may hav
 - systemd
 - `curl`
 - SQLite
-- `maxapi-python==2.4.1`
+- `maxapi-python==2.5.0`
 - SOCKS5 proxy for Telegram API
 
 The production installation used by this project is normally:
@@ -417,11 +417,10 @@ Unknown event codes are kept visible instead of guessing their meaning.
 
 # Telegram photo → MAX photo
 
-Telemax uses native `pymax.Photo`.
-
-PyMax 2.4.1 expects `photoIds` in the MAX photo-upload URL, but MAX may return a valid upload URL without that query parameter. Telemax installs a compatibility wrapper which uses the actual upload response token, preserving the attachment as a native MAX photo rather than degrading it to a generic file.
-
-The compatibility workaround is tied to the pinned SDK version and should be reassessed when upgrading PyMax.
+Telemax 3.5.6 uses native `pymax.Photo` from PyMax 2.5.0. Upstream now
+supports upload URLs without `photoIds` and reads the photo token from the
+upload response. The Telemax 3.5.5 monkey-patch has been removed. Existing
+retry/uncertain-delivery safeguards remain unchanged.
 
 ---
 
