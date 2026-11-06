@@ -487,53 +487,30 @@ __pycache__/
 
 # Updating production from Git
 
-Update staging:
+Keep the repository at `~/distros/telemax` and production runtime at `~/telemax`.
 
 ```bash
-cd ~/telemax_new
+mkdir -p ~/distros
+git clone git@github.com:Ramazzzzan/telemax.git ~/distros/telemax  # once
+cd ~/distros/telemax
 git pull --ff-only origin main
+./deploy.sh --dry-run
+./deploy.sh
 ```
 
-Stop service and back up the production database:
+If `~/distros/telemax` already exists, skip `git clone`.
 
-```bash
-sudo systemctl stop telemax.service
+`deploy.sh` requires successful GitHub Actions for the exact checked-out commit,
+builds a fresh venv with the SDK version pinned by the release, runs unit tests
+and config checks, stops `telemax.service`, backs up the production database
+and code, switches the venv and release files, validates state, then starts the service.
+It restores old code and venv on preflight/start failures.
 
-sqlite3 ~/telemax/telegram_queue.db \
-  ".backup '$HOME/telemax/telegram_queue.db.pre-update.bak'"
-```
+`--skip-ci-check` bypasses the remote CI gate **only when explicitly requested**;
+it does not skip local tests. The script does not copy or overwrite
+`constants.json`, `session_cache/`, live SQLite or queued media.
 
-Copy release files only:
-
-```bash
-cp ~/telemax_new/telemax.py \
-   ~/telemax_new/telemax_test.py \
-   ~/telemax_new/deployment.md \
-   ~/telemax_new/README.md \
-   ~/telemax/
-```
-
-Do **not** copy staging `constants.json`, database, session, media, inbox or virtualenv into production.
-
-Check production:
-
-```bash
-cd ~/telemax
-
-./venv/bin/python telemax.py --version
-./venv/bin/python telemax.py --check
-./venv/bin/python -m unittest -v telemax_test
-```
-
-If all checks pass:
-
-```bash
-sudo systemctl start telemax.service
-sudo systemctl status telemax.service --no-pager
-sudo journalctl -u telemax.service -n 100 --no-pager
-```
-
-For database upgrades from older schema versions, clean installation details and rollback guidance, see `deployment.md`.
+For a first installation, migration or manual recovery see `deployment.md`.
 
 ---
 

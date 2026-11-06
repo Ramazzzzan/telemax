@@ -518,7 +518,7 @@ class FreshStateTests(unittest.TestCase):
         with sqlite_connection(self.root / "telegram_queue.db") as conn:
             meta = dict(conn.execute("SELECT key,value FROM tm_meta"))
             self.assertEqual(meta["schema"], app.SCHEMA_VERSION)
-            self.assertEqual(meta["created_by"], "3.5.5")
+            self.assertEqual(meta["created_by"], app.VERSION)
             self.assertEqual(meta["tg_bot_id"], "123")
             self.assertEqual(meta["tg_chat_id"], "-100")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tm_jobs").fetchone()[0], 0)
@@ -636,7 +636,7 @@ class FreshStateTests(unittest.TestCase):
                                 cwd=self.root, env={**os.environ, "PYTHONPATH": str(Path(app.__file__).parent)},
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "3.5.5")
+        self.assertEqual(result.stdout.strip(), app.VERSION)
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_cli_init_is_offline_and_repeated_init_fails(self):
@@ -656,7 +656,7 @@ class FreshStateTests(unittest.TestCase):
         result = subprocess.run([sys.executable, app.__file__, "--version"], cwd=self.root,
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "Telemax 3.5.5")
+        self.assertEqual(result.stdout.strip(), f"Telemax {app.VERSION}")
 
 
 class Config350Tests(unittest.TestCase):
@@ -2379,16 +2379,19 @@ class Release353Tests(BridgeFixture):
             await self.bridge.send_max(job, data)
 
     async def test_pymax_important_update_alert_is_once_per_version(self):
+        major, minor, patch_number = app.semver(app.SDK_VERSION)
+        offered = f"{major}.{minor}.{patch_number + 1}"
         self.bridge.external_json = AsyncMock(side_effect=[
-            {"info": {"version": "2.5.0"}},
+            {"info": {"version": offered}},
             {"commits": [{"commit": {"message": "Security fix for authentication handshake"}}]},
         ])
         self.bridge.push = AsyncMock(return_value=True)
         state = await self.bridge.check_pymax_update()
         self.assertTrue(state["important"])
-        self.assertEqual(state["latest"], "2.5.0")
-        self.assertEqual(await self.store.meta("pymax_update_alerted_version"), "2.5.0")
-        notices = await self.store.read("SELECT * FROM tm_jobs WHERE key='pymax-update:2.5.0'")
+        self.assertEqual(state["latest"], offered)
+        self.assertEqual(await self.store.meta("pymax_update_alerted_version"), offered)
+        notices = await self.store.read(
+            "SELECT * FROM tm_jobs WHERE key=?", (f"pymax-update:{offered}",))
         self.assertEqual(len(notices), 1)
         self.bridge.push.assert_awaited_once()
 
