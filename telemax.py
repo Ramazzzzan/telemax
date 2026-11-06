@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.6 — MAX <-> Telegram bridge.
+"""Telemax 3.5.7 — MAX <-> Telegram bridge.
 
 Python 3.10+; maxapi-python==2.5.0; curl; Linux.
 Configure constants.json, run --init once, then start normally.
@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlsplit
 
-VERSION = "3.5.6"
+VERSION = "3.5.7"
 SCHEMA_VERSION = "351"  # Storage format, not application release number.
 UPGRADE_SCHEMAS = {"3", "350"}
 SDK_VERSION = "2.5.0"
@@ -1893,6 +1893,26 @@ class Bridge:
             if active:
                 raise Retry("Waiting for own-message correlation", 2, count=False)
 
+        # A human can forward an already received MAX message back into its
+        # original group. Its new ID/sender differ, but the FORWARD source ID
+        # points to an already prepared max_in job from this very same chat.
+        # Suppress only that exact case; never compare message texts or filter
+        # forwarded messages originating from other chats.
+        linked = data.get("forward")
+        if isinstance(linked, dict):
+            original_id = number(linked.get("id"))
+            same_chat = number(linked.get("chat_id")) == number(data.get("chat_id"))
+            if same_chat and original_id is not None and original_id != number(data.get("id")):
+                original = await self.store.read(
+                    "SELECT state FROM tm_jobs WHERE key=? AND kind='max_in' LIMIT 1",
+                    (f"max:{target}:{original_id}",))
+                if original and original[0]["state"] == "done":
+                    await self.store.finish(job, {
+                        "suppressed": "same-chat-forward-of-processed-message",
+                        "original_message_id": original_id,
+                    })
+                    return
+
         rows = await self.store.read("SELECT * FROM tm_routes WHERE max_id=?", (target,))
         title, chat_type = data.get("title"), "group"
         if rows:
@@ -2245,7 +2265,12 @@ class Bridge:
             response = await asyncio.wait_for(self.client.forward_message(
                 chat_id=target_chat, message_id=source_message, source_chat_id=source_chat), 120)
         except Exception as exc:
-            raise Uncertain(f"MAX mirror forward result unknown ({type(exc).__name__}); check before forced retry") from exc
+            error_code = getattr(exc, "error", None)
+            if error_code == "proto.payload":
+                raise Permanent("MAX rejected mirror payload (proto.payload); message not delivered") from exc
+            safe_code = re.sub(r"[^A-Za-z0-9_.-]", "_", str(error_code))[:80] if error_code else ""
+            label = type(exc).__name__ + (f":{safe_code}" if safe_code else "")
+            raise Uncertain(f"MAX mirror forward result unknown ({label}); check before forced retry") from exc
         mid = get(response, "id")
         if mid is None:
             raise Uncertain("MAX mirror forward returned no message ID")
@@ -3132,6 +3157,49 @@ def systemd_notify(message: str):
 
 
 
+def install_pymax_numeric_forward_compat() -> None:
+    """Work around PyMax 2.5.0 serializing FORWARD link.messageId as a string.
+
+    MAX returns proto.payload / Expected number for that wire type. Keep PyMax's
+    native forward, CID generation and response binding; correct only the wire
+    representation of the numeric MAX message ID. Removed when upstream fixes it.
+    """
+    from pymax.api.binding import bind_api_model
+    from pymax.api.messages.payloads import (
+        ForwardLink, ForwardMessagePayload, ForwardMessagePayloadMessage,
+    )
+    from pymax.api.messages.service import MessageService
+    from pymax.api.response import require_payload_model
+    from pymax.protocol import Opcode
+    from pymax.types.domain import Message
+
+    if getattr(MessageService.forward_message, "_telemax_numeric_link_id", False):
+        return
+
+    async def forward_message_numeric(self, chat_id, message_id,
+                                      source_chat_id=None, *, notify=True):
+        target = number(chat_id)
+        source = number(chat_id if source_chat_id is None else source_chat_id)
+        message_number = number(message_id)
+        if target in (None, 0) or source in (None, 0) or message_number is None or message_number <= 0:
+            raise ValueError("Native MAX forward requires numeric chat and message IDs")
+        frame = ForwardMessagePayload(
+            chat_id=target,
+            message=ForwardMessagePayloadMessage(
+                cid=-self._next_cid(),
+                link=ForwardLink(message_id=str(message_number), chat_id=source),
+            ),
+            notify=notify,
+        )
+        payload = frame.to_payload()
+        payload["message"]["link"]["messageId"] = message_number
+        response = await self.app.invoke(Opcode.MSG_SEND, payload)
+        return bind_api_model(self.app, require_payload_model(response, Message))
+
+    forward_message_numeric._telemax_numeric_link_id = True
+    MessageService.forward_message = forward_message_numeric
+
+
 def load_sdk():
     try:
         installed = importlib.metadata.version("maxapi-python")
@@ -3141,6 +3209,7 @@ def load_sdk():
         raise RuntimeError(f"Expected maxapi-python=={SDK_VERSION}; installed: {installed}")
     from pymax import Client, File, Photo, UploadError, Video, VideoNote, Voice
     from pymax.config import ExtraConfig
+    install_pymax_numeric_forward_compat()
     return Client, ExtraConfig, {"document": File, "photo": Photo, "video": Video,
                                 "voice": Voice, "video_note": VideoNote}, UploadError
 

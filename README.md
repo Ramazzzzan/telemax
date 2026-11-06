@@ -2,7 +2,7 @@
 
 Telemax — self-hosted MAX ↔ Telegram bridge for a personal MAX account, based on [PyMax](https://github.com/MaxApiTeam/PyMax).
 
-Current release: **3.5.6**  
+Current release: **3.5.7**  
 Database schema: **351**  
 Pinned SDK: **maxapi-python==2.5.0**
 
@@ -313,7 +313,16 @@ The same Telegram bot must be present in that external group and have permission
 
 MAX → MAX mirror uses native PyMax `forward_message()`, so original MAX attachments do not need to be downloaded and re-uploaded.
 
-Loop protection uses the exact returned MAX message ID.
+Loop protection uses the exact returned MAX message ID. From 3.5.7,
+when a message is forwarded **back into its own MAX chat** and the original
+message was already processed, Telemax suppresses that intra-chat repeat
+by the original chat/message ID (not by text). Forwards from other chats
+continue to work.
+
+PyMax 2.5.0 serializes native forward `link.messageId` as a string, while
+MAX expects a number; Telemax 3.5.7 applies a narrowly scoped runtime
+compatibility patch to the forward payload. Explicit `proto.payload`
+validation errors are classified as rejected, not delivery-uncertain.
 
 `/mute` affects the normal MAX → base-Telegram-topic route only. Mirror destinations remain active.
 

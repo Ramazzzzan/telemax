@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemax 3.5.6 regression tests. Run: python -m unittest -v telemax_test.
+"""Telemax 3.5.7 regression tests. Run: python -m unittest -v telemax_test.
 
 The core suite uses temporary SQLite databases, mocked external APIs and loopback
 HTTP only. No MAX or Telegram credentials are read. Optional SDK contract tests
@@ -2588,3 +2588,88 @@ class PyMax250PhotoContractTests(unittest.IsolatedAsyncioTestCase):
         with patch("pymax.api.uploads.service.aiohttp.ClientSession", Session):
             result = await uploader.upload_photo(photo)
         self.assertEqual(result.photo_token, "native-photo-token")
+
+class Release357ForwardTests(BridgeFixture):
+    async def test_same_chat_forward_of_processed_message_is_not_repeated(self):
+        rule = app.MirrorRule(source_max_chat_id=100, target_max_chat_id=200,
+                              target_tg_chat_id=-100999, target_tg_thread_id=321,
+                              normal_forward=False)
+        self.bridge.cfg = dataclasses.replace(self.cfg, mirror_rules=(rule,))
+        original = {"id": 1001, "chat_id": 100, "sender": 2,
+                    "text": "unique message", "type": "USER", "time": 1000,
+                    "files": [], "received_at": time.time()}
+        first = await self.job("max_in", original, key="max:100:1001")
+        await self.bridge.prepare_max(first, original)
+        forwarded = {"id": 1002, "chat_id": 100, "sender": 3,
+                     "text": "", "type": "USER", "time": 1010,
+                     "files": [], "received_at": time.time(),
+                     "forward": {"id": 1001, "chat_id": 100, "sender": 2,
+                                 "text": "unique message", "files": []}}
+        second = await self.job("max_in", forwarded, key="max:100:1002")
+        await self.bridge.prepare_max(second, forwarded)
+        row = (await self.store.read("SELECT result,state FROM tm_jobs WHERE id=?", (second["id"],)))[0]
+        self.assertEqual(row["state"], "done")
+        self.assertEqual(json.loads(row["result"])["suppressed"],
+                         "same-chat-forward-of-processed-message")
+        self.assertFalse(await self.store.read(
+            "SELECT id FROM tm_jobs WHERE key LIKE 'max:100:1002/%'"))
+
+    async def test_forward_of_message_from_another_chat_is_retained(self):
+        rule = app.MirrorRule(source_max_chat_id=100, target_max_chat_id=200,
+                              target_tg_chat_id=-100999, target_tg_thread_id=321,
+                              normal_forward=False)
+        self.bridge.cfg = dataclasses.replace(self.cfg, mirror_rules=(rule,))
+        forwarded = {"id": 1004, "chat_id": 100, "sender": 3,
+                     "text": "", "type": "USER", "time": 1010,
+                     "files": [], "received_at": time.time(),
+                     "forward": {"id": 1001, "chat_id": 300, "sender": 2,
+                                 "text": "from another MAX chat", "files": []}}
+        job = await self.job("max_in", forwarded, key="max:100:1004")
+        await self.bridge.prepare_max(job, forwarded)
+        kinds = await self.store.read(
+            "SELECT kind FROM tm_jobs WHERE key LIKE 'max:100:1004/%' ORDER BY id")
+        self.assertEqual([r["kind"] for r in kinds], ["mirror_max", "mirror_tg"])
+
+    async def test_explicit_proto_payload_rejection_is_not_uncertain(self):
+        class FakeApiError(Exception):
+            error = "proto.payload"
+        self.client.forward_message.side_effect = FakeApiError("Expected number")
+        job = await self.job("mirror_max",
+                             {"source_chat_id": 100, "source_message_id": 101},
+                             route="200", key="fwd:test")
+        with self.assertRaises(Permanent):
+            await self.bridge.send_mirror_max(job, {
+                "source_chat_id": 100, "source_message_id": 101})
+
+
+@unittest.skipUnless(SDK_PRESENT, "requires maxapi-python==2.5.0")
+class PyMax250NumericForwardContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_forward_wire_message_id_is_integer(self):
+        """Capture the real patched SDK invocation before any network activity."""
+        app.load_sdk()
+        from pymax.api.messages.service import MessageService
+        from pymax.protocol import Opcode
+
+        class CapturePayload(Exception):
+            pass
+
+        observed = []
+
+        async def capture(opcode, payload):
+            observed.append((opcode, payload))
+            raise CapturePayload()
+
+        service = MessageService(NS(invoke=capture))
+        with self.assertRaises(CapturePayload):
+            await service.forward_message(
+                chat_id=-75811741490645,
+                message_id=117569795661385789,
+                source_chat_id=-70337950184917)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0][0], Opcode.MSG_SEND)
+        wire = observed[0][1]
+        self.assertEqual(wire["chatId"], -75811741490645)
+        self.assertEqual(wire["message"]["link"]["chatId"], -70337950184917)
+        self.assertEqual(wire["message"]["link"]["messageId"], 117569795661385789)
+        self.assertIsInstance(wire["message"]["link"]["messageId"], int)
+        self.assertLess(wire["message"]["cid"], 0)
