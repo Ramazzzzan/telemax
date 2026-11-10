@@ -7,7 +7,7 @@ umask 077
 SOURCE_DIR="${TELEMAX_SOURCE_DIR:-$HOME/distros/telemax}"
 PROD_DIR="${TELEMAX_PROD_DIR:-$HOME/telemax}"
 SERVICE="${TELEMAX_SERVICE:-telemax.service}"
-PIP_PROXY="${TELEMAX_PIP_PROXY:-socks5h://127.0.0.1:10808}"
+PIP_PROXY="${TELEMAX_PIP_PROXY:-socks5h://127.0.0.1:11080}"
 REPO_SLUG='Ramazzzzan/telemax'
 DRY_RUN=0
 SKIP_CI=0

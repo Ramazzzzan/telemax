@@ -55,7 +55,7 @@ sudo systemctl stop telemax.service
 cp -p telemax.py "telemax.py.pre-3.5.6.$(date +%Y%m%d-%H%M%S)"
 sqlite3 telegram_queue.db ".backup 'telegram_queue.db.pre-3.5.6.bak'"
 ./venv/bin/python -m pip freeze > requirements.pre-3.5.6.txt
-./venv/bin/python -m pip install --proxy socks5h://127.0.0.1:10808 "maxapi-python==2.5.0"
+./venv/bin/python -m pip install --proxy socks5h://127.0.0.1:11080 "maxapi-python==2.5.0"
 ./venv/bin/python -m pip check
 cp /path/to/release/telemax.py /path/to/release/telemax_test.py .
 ./venv/bin/python telemax.py --check
@@ -375,7 +375,7 @@ translation-префиксы в `BLOCKED_IPV6_PREFIXES` и ограничьте 
   "MY_MAX_ID": null,
   "TG_ALLOWED_USER_IDS": [123456789],
   "TG_ADMIN_USER_IDS": [123456789],
-  "TG_PROXY": "socks5h://127.0.0.1:10808",
+  "TG_PROXY": "socks5h://127.0.0.1:11080",
   "NTFY_URL": "",
   "MAX_MEDIA_MB": 49,
   "TG_DOWNLOAD_MB": 20,
@@ -552,7 +552,7 @@ from pathlib import Path
 
 cfg = json.loads(Path('constants.json').read_text(encoding='utf-8'))
 url = f"https://api.telegram.org/bot{cfg['TG_BOT_TOKEN']}/getUpdates"
-proxy = cfg.get('TG_PROXY', 'socks5h://127.0.0.1:10808')
+proxy = cfg.get('TG_PROXY', 'socks5h://127.0.0.1:11080')
 curl_config = (
     f'url = "{url}"\n'
     f'proxy = "{proxy}"\n'
@@ -598,8 +598,11 @@ sudo systemctl start telemax.service
 Пример нового каталога: `/home/htpc/telemax-3.5.6`, пользователь `htpc`.
 
 1. Нужны Python 3.10+, venv, `curl`, CA certificates, а для приведённых команд —
-   `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:10808`
+   `sqlite3`, `tar`, systemd. Уже настроенный SOCKS5 должен слушать `127.0.0.1:11080`
    либо адрес из `TG_PROXY`. Установка Telemax не устанавливает сам прокси.
+   На HTPC используется `socks5h://127.0.0.1:11080`: это мост к USB/WAN3,
+   который должен быть установлен отдельно. Не переносите весь `telemax.service`
+   в namespace WAN3: соединения MAX остаются в основной сети WAN1.
 2. Создайте каталог, положите три файла релиза и `constants.json` по примеру выше.
 3. Подготовьте окружение и пустую БД:
 

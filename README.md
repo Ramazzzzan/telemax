@@ -92,7 +92,7 @@ For a normal production installation with Telegram → MAX enabled:
   "TG_ALLOWED_USER_IDS": [123456789],
   "TG_ADMIN_USER_IDS": [123456789],
 
-  "TG_PROXY": "socks5h://127.0.0.1:10808",
+  "TG_PROXY": "socks5h://127.0.0.1:11080",
 
   "MIRROR_RULES": []
 }
@@ -128,7 +128,7 @@ The following is the complete set of currently supported top-level settings. Val
   "TG_ADMIN_USER_IDS": [],
   "MY_MAX_ID": null,
 
-  "TG_PROXY": "socks5h://127.0.0.1:10808",
+  "TG_PROXY": "socks5h://127.0.0.1:11080",
   "NTFY_URL": "",
 
   "MAX_MEDIA_MB": 49,
@@ -179,12 +179,14 @@ If both Telegram user lists are empty, MAX → Telegram still works, but Telegra
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `TG_PROXY` | `socks5h://127.0.0.1:10808` | SOCKS5 proxy used for Telegram/API checks. |
+| `TG_PROXY` | `socks5h://127.0.0.1:11080` | SOCKS5 proxy used for Telegram/API checks. |
 | `NTFY_URL` | `""` | Optional ntfy endpoint. Empty disables ntfy notifications. |
 | `MEDIA_IPV4_ONLY` | `true` | Restrict remote MAX media download resolution to IPv4 for SSRF/NAT64 safety. |
 | `BLOCKED_IPV6_PREFIXES` | `[]` | Additional IPv6 networks to block if IPv6 media downloads are enabled. |
 
 MAX itself is not forced through `TG_PROXY`.
+
+For this HTPC, `127.0.0.1:11080` is the local SOCKS5 forwarder to the USB/WAN3 network namespace. Only Telegram API calls use `TG_PROXY`; MAX authentication, MAX SDK connections, and direct MAX media transfers retain the host WAN1 route. Do not move the entire `telemax.service` into WAN3. The `htpc-tg-wan3-backend.service` and `htpc-tg-wan3-forward.socket` must be ready before Telegram communication.
 
 ### Storage, retry and concurrency
 

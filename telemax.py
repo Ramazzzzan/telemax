@@ -385,7 +385,7 @@ class Config:
     allowed: frozenset[int] = frozenset()
     admins: frozenset[int] = frozenset()
     my_max_id: int | None = None
-    proxy: str = "socks5h://127.0.0.1:10808"
+    proxy: str = "socks5h://127.0.0.1:11080"
     ntfy: str = ""
     max_file_bytes: int = 49 * 1024 * 1024
     max_tg_download_bytes: int = 20 * 1024 * 1024
@@ -478,7 +478,7 @@ class Config:
         own = number(data.get("MY_MAX_ID"))
         if data.get("MY_MAX_ID") is not None and (own is None or own <= 0):
             raise ValueError("MY_MAX_ID must be a positive integer or null")
-        proxy = str(data.get("TG_PROXY", "socks5h://127.0.0.1:10808"))
+        proxy = str(data.get("TG_PROXY", "socks5h://127.0.0.1:11080"))
         if any(ord(c) < 33 for c in proxy):
             raise ValueError("TG_PROXY must not contain whitespace/control characters")
         u = urlsplit(proxy)

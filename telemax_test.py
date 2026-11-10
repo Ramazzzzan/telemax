@@ -704,7 +704,7 @@ class Config350Tests(unittest.TestCase):
         self.assertEqual(cfg.disk_limit, 2048 * 1024**2)
         self.assertEqual(cfg.history_days, 30)
         self.assertEqual(cfg.max_attempts, 10)
-        self.assertEqual(cfg.proxy, "socks5h://127.0.0.1:10808")
+        self.assertEqual(cfg.proxy, "socks5h://127.0.0.1:11080")
 
     def test_telegram_download_limit_cannot_be_raised_past_20(self):
         self.assertEqual(self.load(TG_DOWNLOAD_MB=100).max_tg_download_bytes, 20 * 1024**2)
@@ -719,9 +719,9 @@ class Config350Tests(unittest.TestCase):
                         self.load(**{field: value})
 
     def test_proxy_is_explicit_socks5h_without_path(self):
-        for value in ("", "http://127.0.0.1:10808", "socks5://127.0.0.1:10808",
-                      "socks5h://127.0.0.1:10808/path", "socks5h://host:99999",
-                      "socks5h://host:10808\n", "socks5h://host:10808?x=1"):
+        for value in ("", "http://127.0.0.1:11080", "socks5://127.0.0.1:11080",
+                      "socks5h://127.0.0.1:11080/path", "socks5h://host:99999",
+                      "socks5h://host:11080\n", "socks5h://host:11080?x=1"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.load(TG_PROXY=value)
 
